@@ -219,4 +219,31 @@ CUDA_VISIBLE_DEVICES=4 python /home/dyz/PythonProject/Test_Codes/Sampling_test/t
     --weight_decay 1e-5 \
     --log_dir /home/dyz/PythonProject/Test_Codes/Sampling_test/log \
     --tensorboard_log_dir /home/dyz/PythonProject/log/tensorboard/sample-test
+
+
+     CUDA_VISIBLE_DEVICES=0 python /home/dyz/PythonProject/Test_Codes/Sampling_test/train.py \
+    --model_type adaptive_sphere_uformer \
+    --dataset_name Sports-360 \
+    --dataset_root_dir /home/dyz/PythonProject/Dataset/Sports-360 \
+    --mode vertex \
+    --img_rank 6 \
+    --seq_length 30 \
+    --train_batch_size 1 \
+    --val_batch_size 1 \
+    --num_workers 4 \
+    --num_epochs 60 \
+    --optimizer adam \
+    --learning_rate 1e-4 \
+    --lr_scheduler reduce_on_plateau \
+    --rel_pos_init_variance 0 \
+    --coarse_rank_offset 2 \
+    --adaptive_coarse_depth 2 \
+    --adaptive_fine_depth 1 \
+    --adaptive_temperature 1.0 \
+    --target_refine_ratio 0.25 \
+    --lambda_coarse 0.3 \
+    --lambda_refine 0.2 \
+    --lambda_budget 0.05 \
+    --log_dir /home/dyz/PythonProject/Test_Codes/Sampling_test/log \
+    --tensorboard_log_dir /home/dyz/PythonProject/log/tensorboard/sample-test
 """
