@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[cod]
+
+# Training outputs (`train.py --log_dir`, default: `log`)
+/log/
+/logs/
+/log_*/
+/*_log/
+/runs/
+
+# Experiment trackers and TensorBoard event files
+tensorboard/
+wandb/
+events.out.tfevents.*
+
+# Model checkpoints produced inside training runs
+*.pth
+*.pt
+*.ckpt
