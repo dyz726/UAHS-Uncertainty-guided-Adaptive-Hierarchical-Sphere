@@ -19,7 +19,12 @@ from trimesh import Trimesh
 
 from .position_encoding import GlobalVerticalPositionEnconding
 from .sphere_PSA import SphereSelfAttention,SphereSpatioTemporalAttention
-from trimesh_utils import get_icosphere, IcoSphereRef, asSpherical
+from trimesh_utils import (
+    get_icosphere,
+    IcoSphereHierarchy,
+    IcoSphereRef,
+    asSpherical,
+)
 
 
 
@@ -710,153 +715,121 @@ class SphereUFormer(nn.Module):
         return sal_map
 
 
-def _nearest_spherical_indices(
-        source_normals: np.ndarray,
-        target_normals: np.ndarray,
-        chunk_size: int = 4096,
-) -> torch.Tensor:
-    """Map each source normal to its nearest target without a full similarity matrix."""
-    target = target_normals.astype(np.float32, copy=False)
-    indices = []
-    for start in range(0, len(source_normals), chunk_size):
-        source = source_normals[start:start + chunk_size].astype(np.float32, copy=False)
-        indices.append(np.argmax(source @ target.T, axis=1))
-    return torch.from_numpy(np.concatenate(indices).astype(np.int64, copy=False))
-
-
-def _vertex_ancestor_indices(
-        coarse_rank: int,
-        fine_rank: int,
-        icosphere_ref: IcoSphereRef,
-) -> torch.Tensor:
-    """Follow trimesh midpoint parents to one deterministic coarse ancestor."""
-    ancestor = torch.arange(
-        len(icosphere_ref.get_normals(coarse_rank)), dtype=torch.long
-    )
-    for rank in range(coarse_rank + 1, fine_rank + 1):
-        mesh = icosphere_ref.get_icosphere(rank, refine=True)
-        previous_size = ancestor.numel()
-        current = torch.empty(len(mesh.vertices), dtype=torch.long)
-        current[:previous_size] = ancestor
-        for node_idx in range(previous_size, len(mesh.vertices)):
-            parents = [
-                neighbor for neighbor in mesh.vertex_neighbors[node_idx]
-                if neighbor < previous_size
-            ]
-            if len(parents) != 2:
-                raise RuntimeError(
-                    f"Vertex {node_idx} at rank {rank} has {len(parents)} parents"
-                )
-            current[node_idx] = ancestor[min(parents)]
-        ancestor = current
-    return ancestor
-
-
-class SphericalHierarchyMapping(nn.Module):
-    """Reusable nearest-region mapping between two cached icosphere ranks.
-
-    The mapping is built once during initialization and stored as buffers.  It is
-    deliberately dense indexing, not sparse adaptive computation.
-    """
+class HierarchicalRegionPool(nn.Module):
+    """Pool fine vertex features through exact face descendants."""
 
     def __init__(
             self,
-            coarse_rank: int,
-            fine_rank: int,
-            icosphere_ref: IcoSphereRef,
+            dim: int,
+            pool_type: str = "mean_max",
     ):
         super().__init__()
-        if coarse_rank < 0 or fine_rank < coarse_rank:
-            raise ValueError(
-                f"Expected 0 <= coarse_rank <= fine_rank, got "
-                f"{coarse_rank} and {fine_rank}"
-            )
+        if pool_type not in {"center", "mean", "mean_max"}:
+            raise ValueError(f"Unsupported coarse_pool_type: {pool_type}")
+        self.pool_type = pool_type
+        if pool_type != "center":
+            input_dim = dim if pool_type == "mean" else 2 * dim
+            self.projection = nn.Linear(input_dim, dim)
 
-        self.coarse_rank = coarse_rank
-        self.fine_rank = fine_rank
-        coarse_normals = icosphere_ref.get_normals(coarse_rank)
-        fine_normals = icosphere_ref.get_normals(fine_rank)
-
-        if coarse_rank == fine_rank:
-            fine_to_coarse = torch.arange(len(fine_normals), dtype=torch.long)
-            coarse_center = fine_to_coarse.clone()
-        elif icosphere_ref.node_type == "vertex":
-            # Subdivision retains old vertices and appends edge midpoints.
-            fine_to_coarse = _vertex_ancestor_indices(
-                coarse_rank, fine_rank, icosphere_ref
-            )
-            coarse_center = torch.arange(len(coarse_normals), dtype=torch.long)
+    def forward(
+            self,
+            fine_vertex_features: Tensor,
+            hierarchy: IcoSphereHierarchy,
+    ) -> Tensor:
+        if self.pool_type == "center":
+            return hierarchy.center_downsample_vertices(fine_vertex_features)
+        fine_face_mean, _ = hierarchy.vertex_feature_stats(
+            fine_vertex_features, level="fine"
+        )
+        region_mean, region_max = hierarchy.fine_face_feature_stats(
+            fine_face_mean
+        )
+        if self.pool_type == "mean":
+            coarse_face_features = self.projection(region_mean)
         else:
-            # Trimesh emits four consecutive children for every parent face;
-            # this is also the ordering assumed by the existing face pooling.
-            fine_to_coarse = torch.arange(
-                len(coarse_normals), dtype=torch.long
-            ).repeat_interleave(4 ** (fine_rank - coarse_rank))
-            coarse_center = _nearest_spherical_indices(
-                coarse_normals, fine_normals
+            coarse_face_features = self.projection(
+                torch.cat((region_mean, region_max), dim=-1)
             )
-
-        child_count = torch.bincount(
-            fine_to_coarse, minlength=len(coarse_normals)
-        ).clamp_min(1)
-        self.register_buffer("fine_to_coarse_idx", fine_to_coarse)
-        self.register_buffer("coarse_center_idx", coarse_center)
-        self.register_buffer("child_count", child_count)
-
-    @property
-    def coarse_size(self) -> int:
-        return int(self.child_count.numel())
-
-    @property
-    def fine_size(self) -> int:
-        return int(self.fine_to_coarse_idx.numel())
-
-    def upsample(self, x: Tensor, node_dim: int) -> Tensor:
-        """Nearest-region upsample along ``node_dim``."""
-        return torch.index_select(x, node_dim, self.fine_to_coarse_idx)
-
-    def center_downsample(self, x: Tensor, node_dim: int) -> Tensor:
-        """Select the fine node nearest each coarse node."""
-        return torch.index_select(x, node_dim, self.coarse_center_idx)
-
-    def aggregate_mean(self, values: Tensor) -> Tensor:
-        """Mean fine scalar values into coarse regions; node dimension is last."""
-        if values.shape[-1] != self.fine_size:
-            raise ValueError(
-                f"Expected {self.fine_size} fine nodes, got {values.shape[-1]}"
-            )
-        flat = values.reshape(-1, self.fine_size)
-        index = self.fine_to_coarse_idx.unsqueeze(0).expand(flat.shape[0], -1)
-        sums = flat.new_zeros((flat.shape[0], self.coarse_size))
-        sums.scatter_add_(1, index, flat)
-        means = sums / self.child_count.to(dtype=flat.dtype).unsqueeze(0)
-        return means.reshape(*values.shape[:-1], self.coarse_size)
+        return hierarchy.face_features_to_vertices(
+            coarse_face_features, level="coarse"
+        )
 
 
-class AdaptiveRefinementHead(nn.Module):
-    """Predict region difficulty from coarse content and temporal change."""
+class VertexToFaceAggregation(nn.Module):
+    """Aggregate three coarse vertex features into one triangular region."""
 
-    def __init__(self, dim: int, use_motion: bool = True):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.projection = nn.Linear(2 * dim, dim)
+
+    def forward(
+            self,
+            coarse_vertex_features: Tensor,
+            hierarchy: IcoSphereHierarchy,
+    ) -> Tensor:
+        mean, maximum = hierarchy.vertex_feature_stats(
+            coarse_vertex_features, level="coarse"
+        )
+        return self.projection(torch.cat((mean, maximum), dim=-1))
+
+
+class SphericalUncertaintyHead(nn.Module):
+    """Predict positive heteroscedastic Laplace scale without using labels."""
+
+    def __init__(self, dim: int, epsilon: float = 1e-6):
         super().__init__()
         hidden_dim = max(1, dim // 2)
-        self.use_motion = use_motion
-        self.refinement_mlp = nn.Sequential(
-            nn.Linear(dim + 1, hidden_dim),
+        self.epsilon = epsilon
+        self.scale_mlp = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, features: Tensor) -> Tuple[Tensor, Tensor]:
-        """Return logits and scores for features shaped [B, T, Lc, C]."""
-        if self.use_motion and features.shape[1] > 1:
-            delta = (features[:, 1:] - features[:, :-1]).abs().mean(
+    def forward(self, face_features: Tensor) -> Tensor:
+        raw_scale = self.scale_mlp(face_features).squeeze(-1)
+        return F.softplus(raw_scale) + self.epsilon
+
+
+class AdaptiveRefinementHead(nn.Module):
+    """Predict face refinement from content, uncertainty, and motion."""
+
+    def __init__(
+            self,
+            dim: int,
+            use_uncertainty: bool = True,
+            use_motion: bool = True,
+    ):
+        super().__init__()
+        hidden_dim = max(1, dim // 2)
+        self.use_uncertainty = use_uncertainty
+        self.use_motion = use_motion
+        self.refinement_mlp = nn.Sequential(
+            nn.Linear(dim + 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+            self,
+            face_features: Tensor,
+            uncertainty_scale: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        """Return logits and scores for [B, T, Fcoarse, C] features."""
+        if self.use_motion and face_features.shape[1] > 1:
+            delta = (face_features[:, 1:] - face_features[:, :-1]).abs().mean(
                 dim=-1, keepdim=True
             )
-            first = torch.zeros_like(delta[:, :1])
-            motion = torch.cat((first, delta), dim=1)
+            motion = torch.cat((torch.zeros_like(delta[:, :1]), delta), dim=1)
         else:
-            motion = torch.zeros_like(features[..., :1])
-        logits = self.refinement_mlp(torch.cat((features, motion), dim=-1)).squeeze(-1)
+            motion = torch.zeros_like(face_features[..., :1])
+        if self.use_uncertainty:
+            # Calibration is governed by L_uncertainty, not by gate gradients.
+            uncertainty = uncertainty_scale.detach().unsqueeze(-1)
+        else:
+            uncertainty = torch.zeros_like(face_features[..., :1])
+        inputs = torch.cat((face_features, uncertainty, motion), dim=-1)
+        logits = self.refinement_mlp(inputs).squeeze(-1)
         return logits, torch.sigmoid(logits)
 
 
@@ -879,10 +852,10 @@ class AdaptiveRegionSelector(nn.Module):
 
 
 class AdaptiveSphereUFormer(nn.Module):
-    """Differentiable coarse/fine saliency prototype with a soft adaptive gate.
+    """Dense vertex backbone with face-guided adaptive refinement.
 
-    The fine encoder still processes every fine node.  The gate tests adaptive
-    multi-resolution refinement, but does not yet reduce sparse FLOPs.
+    The fine encoder still processes every fine vertex. The exact face hierarchy
+    gives refinement regions a geometric meaning, but does not reduce FLOPs.
     """
 
     def __init__(
@@ -919,7 +892,11 @@ class AdaptiveSphereUFormer(nn.Module):
             adaptive_coarse_depth: int = 2,
             adaptive_fine_depth: int = 1,
             adaptive_temperature: float = 1.0,
+            adaptive_region_type: str = "face",
+            coarse_pool_type: str = "mean_max",
+            face_to_vertex_reduce: str = "mean",
             use_adaptive_refinement: bool = True,
+            use_uncertainty_refinement: bool = True,
             use_motion_refinement: bool = True,
             return_aux: bool = False,
             debug_adaptive: bool = False,
@@ -933,6 +910,14 @@ class AdaptiveSphereUFormer(nn.Module):
             raise ValueError("Adaptive encoder depths must be positive")
         if embed_dim % num_heads:
             raise ValueError("embed_dim must be divisible by num_heads")
+        if node_type != "vertex":
+            raise ValueError(
+                "AdaptiveSphereUFormer keeps a vertex backbone; use --mode vertex"
+            )
+        if adaptive_region_type != "face":
+            raise ValueError("The audited adaptive hierarchy only supports face regions")
+        if face_to_vertex_reduce != "mean":
+            raise ValueError("Only face_to_vertex_reduce='mean' is implemented")
 
         self.img_rank = img_rank
         self.proj_rank = img_rank - int(math.log2(in_scale_factor))
@@ -946,41 +931,36 @@ class AdaptiveSphereUFormer(nn.Module):
 
         self.embed_dim = embed_dim
         self.out_channels = out_channels
+        self.adaptive_region_type = adaptive_region_type
+        self.coarse_pool_type = coarse_pool_type
+        self.face_to_vertex_reduce = face_to_vertex_reduce
         self.use_adaptive_refinement = use_adaptive_refinement
         self.return_aux = return_aux
         self.debug_adaptive = debug_adaptive
         self.icosphere_ref = IcoSphereRef(node_type=node_type)
 
-        # All hierarchy work is performed once here and then moved with the model.
-        self.coarse_fine_mapping = SphericalHierarchyMapping(
+        # Topology is derived and validated once; all tensors are registered buffers.
+        self.coarse_fine_hierarchy = IcoSphereHierarchy(
             self.coarse_rank, self.fine_rank, self.icosphere_ref
         )
-        self.fine_img_mapping = SphericalHierarchyMapping(
+        self.fine_img_hierarchy = IcoSphereHierarchy(
             self.fine_rank, self.img_rank, self.icosphere_ref
         )
-        if node_type == "vertex":
-            self.output_upsample = nn.Sequential(*[
-                InterpolateUpsample(rank, rank + 1, self.icosphere_ref)
-                for rank in range(self.fine_rank, self.img_rank)
-            ])
-        else:
-            # InterpolateUpsample only supports vertex nodes in the baseline.
-            self.output_upsample = None
-        img_to_coarse = self.coarse_fine_mapping.fine_to_coarse_idx[
-            self.fine_img_mapping.fine_to_coarse_idx
-        ]
-        img_child_count = torch.bincount(
-            img_to_coarse,
-            minlength=self.coarse_fine_mapping.coarse_size,
-        ).clamp_min(1)
-        self.register_buffer("img_to_coarse_idx", img_to_coarse)
-        self.register_buffer("img_child_count", img_child_count)
+        self.coarse_to_fine_upsample = nn.Sequential(*[
+            InterpolateUpsample(rank, rank + 1, self.icosphere_ref)
+            for rank in range(self.coarse_rank, self.fine_rank)
+        ])
+        self.output_upsample = nn.Sequential(*[
+            InterpolateUpsample(rank, rank + 1, self.icosphere_ref)
+            for rank in range(self.fine_rank, self.img_rank)
+        ])
 
         self.fine_input_proj = InputProj(
             in_channels, embed_dim, act_layer=act_layer
         )
-        self.coarse_input_proj = InputProj(
-            in_channels, embed_dim, act_layer=act_layer
+        self.coarse_region_pool = HierarchicalRegionPool(
+            embed_dim,
+            pool_type=coarse_pool_type,
         )
         self.apply_abs_pos_enc_in = abs_pos_enc_in
         if abs_pos_enc_in:
@@ -1043,9 +1023,13 @@ class AdaptiveSphereUFormer(nn.Module):
             **common_module_args,
         )
 
+        self.coarse_vertex_to_face = VertexToFaceAggregation(embed_dim)
         self.coarse_saliency_head = nn.Linear(embed_dim, out_channels)
+        self.uncertainty_head = SphericalUncertaintyHead(embed_dim)
         self.refinement_head = AdaptiveRefinementHead(
-            embed_dim, use_motion=use_motion_refinement
+            embed_dim,
+            use_uncertainty=use_uncertainty_refinement,
+            use_motion=use_motion_refinement,
         )
         self.region_selector = AdaptiveRegionSelector(adaptive_temperature)
         self.fine_projection = nn.Linear(embed_dim, embed_dim)
@@ -1064,47 +1048,52 @@ class AdaptiveSphereUFormer(nn.Module):
             nn.init.constant_(module.weight, 1.0)
 
     def upsample_coarse_values_to_img(self, values: Tensor) -> Tensor:
-        """Upsample [B, T, Lc] values to [B, T, Limg] for auxiliary loss."""
-        fine = self.coarse_fine_mapping.upsample(values, node_dim=-1)
-        if self.output_upsample is None:
-            return self.fine_img_mapping.upsample(fine, node_dim=-1)
-        shape = fine.shape
-        img = self.output_upsample(fine.reshape(-1, shape[-1], 1))
+        """Upsample coarse face values to image-rank vertices for visualization."""
+        fine_faces = self.coarse_fine_hierarchy.propagate_coarse_face_values(values)
+        fine_vertices = self.coarse_fine_hierarchy.fine_face_values_to_vertices(
+            fine_faces
+        )
+        shape = fine_vertices.shape
+        img = self.output_upsample(fine_vertices.reshape(-1, shape[-1], 1))
         return img.squeeze(-1).reshape(*shape[:-1], img.shape[1])
 
-    def aggregate_img_values_to_coarse(self, values: Tensor) -> Tensor:
-        """Aggregate [B, T, Limg] scalar targets to nearest coarse regions."""
-        if values.shape[-1] != self.fine_img_mapping.fine_size:
-            raise ValueError(
-                f"Expected {self.fine_img_mapping.fine_size} image nodes, "
-                f"got {values.shape[-1]}"
-            )
-        flat = values.reshape(-1, values.shape[-1])
-        index = self.img_to_coarse_idx.unsqueeze(0).expand(flat.shape[0], -1)
-        sums = flat.new_zeros((flat.shape[0], self.coarse_fine_mapping.coarse_size))
-        sums.scatter_add_(1, index, flat)
-        means = sums / self.img_child_count.to(flat.dtype).unsqueeze(0)
-        return means.reshape(
-            *values.shape[:-1], self.coarse_fine_mapping.coarse_size
+    def aggregate_img_values_to_coarse_faces(self, values: Tensor) -> Tensor:
+        """Area-weight image-rank vertex targets into exact coarse faces."""
+        img_faces = self.fine_img_hierarchy.vertex_values_to_faces(
+            values, level="fine"
         )
+        fine_faces = self.fine_img_hierarchy.aggregate_fine_face_values(
+            img_faces, area_weighted=True
+        )
+        return self.coarse_fine_hierarchy.aggregate_fine_face_values(
+            fine_faces, area_weighted=True
+        )
+
+    def aggregate_img_values_to_coarse(self, values: Tensor) -> Tensor:
+        """Backward-compatible alias returning coarse face targets."""
+        return self.aggregate_img_values_to_coarse_faces(values)
 
     def forward(self, x: Tensor, return_aux: Optional[bool] = None):
         """Predict saliency from input [B, T, Limg, Cin]."""
         if x.ndim != 4:
             raise ValueError(f"Expected [B, T, L, C] input, got {tuple(x.shape)}")
         B, T, L_img, C = x.shape
-        if L_img != self.fine_img_mapping.fine_size:
+        if L_img != self.fine_img_hierarchy.fine_vertex_count:
             raise ValueError(
                 f"img_rank={self.img_rank} expects "
-                f"{self.fine_img_mapping.fine_size} nodes, got {L_img}"
+                f"{self.fine_img_hierarchy.fine_vertex_count} nodes, got {L_img}"
             )
         flat_img = x.reshape(B * T, L_img, C)
 
-        # Fine RGB is center-sampled from img_rank; coarse RGB from fine_rank.
-        fine_rgb = self.fine_img_mapping.center_downsample(flat_img, node_dim=1)
-        coarse_rgb = self.coarse_fine_mapping.center_downsample(fine_rgb, node_dim=1)
-        fine_features = self.fine_input_proj(fine_rgb)
-        coarse_features = self.coarse_input_proj(coarse_rgb)
+        # Fine vertices are retained subdivision vertices. Coarse content uses
+        # mean/max pooling over exact descendant triangular regions.
+        fine_rgb = self.fine_img_hierarchy.center_downsample_vertices(flat_img)
+        fine_content = self.fine_input_proj(fine_rgb)
+        coarse_content = self.coarse_region_pool(
+            fine_content, self.coarse_fine_hierarchy
+        )
+        fine_features = fine_content
+        coarse_features = coarse_content
         if self.apply_abs_pos_enc_in:
             fine_features = fine_features + self.fine_abs_pos_in(fine_features)
             coarse_features = coarse_features + self.coarse_abs_pos_in(coarse_features)
@@ -1112,31 +1101,47 @@ class AdaptiveSphereUFormer(nn.Module):
         coarse_features = self.pos_drop(coarse_features)
 
         coarse_features = self.coarse_encoder(coarse_features, time_steps=T)
-        coarse_bt = coarse_features.reshape(
-            B, T, self.coarse_fine_mapping.coarse_size, self.embed_dim
+        coarse_face_features = self.coarse_vertex_to_face(
+            coarse_features, self.coarse_fine_hierarchy
         )
-        coarse_logits = self.coarse_saliency_head(coarse_features)
+        coarse_face_bt = coarse_face_features.reshape(
+            B,
+            T,
+            self.coarse_fine_hierarchy.coarse_face_count,
+            self.embed_dim,
+        )
+        coarse_logits = self.coarse_saliency_head(coarse_face_features)
         coarse_saliency = self.final_sigmoid(coarse_logits)
+        uncertainty_scale = self.uncertainty_head(coarse_face_bt)
 
-        refine_logits, refine_score = self.refinement_head(coarse_bt)
-        gate_coarse = self.region_selector(
+        refine_logits, refine_score = self.refinement_head(
+            coarse_face_bt, uncertainty_scale
+        )
+        coarse_face_gate = self.region_selector(
             refine_logits, enabled=self.use_adaptive_refinement
         )
-        fine_refine_score = self.coarse_fine_mapping.upsample(
-            refine_score, node_dim=-1
+        fine_refine_score = self.coarse_fine_hierarchy.propagate_coarse_face_values(
+            refine_score
         )
-        fine_gate = self.coarse_fine_mapping.upsample(gate_coarse, node_dim=-1)
+        fine_face_gate = self.coarse_fine_hierarchy.propagate_coarse_face_values(
+            coarse_face_gate
+        )
+        fine_vertex_gate = self.coarse_fine_hierarchy.fine_face_values_to_vertices(
+            fine_face_gate
+        )
+        area_refine_ratio = (
+            self.coarse_fine_hierarchy.area_weighted_fine_face_ratio(
+                fine_face_gate
+            )
+        )
 
         fine_features = self.fine_encoder(fine_features, time_steps=T)
-        coarse_up = self.coarse_fine_mapping.upsample(coarse_features, node_dim=1)
+        coarse_up = self.coarse_to_fine_upsample(coarse_features)
         fine_residual = self.fine_projection(fine_features)
         fused = self.fusion_norm(
-            coarse_up + fine_gate.reshape(B * T, -1, 1) * fine_residual
+            coarse_up + fine_vertex_gate.reshape(B * T, -1, 1) * fine_residual
         )
-        if self.output_upsample is None:
-            img_features = self.fine_img_mapping.upsample(fused, node_dim=1)
-        else:
-            img_features = self.output_upsample(fused)
+        img_features = self.output_upsample(fused)
         final_logits = self.output_proj(img_features)
 
         if self.out_channels == 1:
@@ -1144,14 +1149,17 @@ class AdaptiveSphereUFormer(nn.Module):
                 final_logits.squeeze(-1).reshape(B, T, L_img)
             )
             coarse_saliency = coarse_saliency.squeeze(-1).reshape(
-                B, T, self.coarse_fine_mapping.coarse_size
+                B, T, self.coarse_fine_hierarchy.coarse_face_count
             )
         else:
             saliency = self.final_sigmoid(
                 final_logits.reshape(B, T, L_img, self.out_channels)
             )
             coarse_saliency = coarse_saliency.reshape(
-                B, T, self.coarse_fine_mapping.coarse_size, self.out_channels
+                B,
+                T,
+                self.coarse_fine_hierarchy.coarse_face_count,
+                self.out_channels,
             )
 
         if self.debug_adaptive:
@@ -1159,12 +1167,19 @@ class AdaptiveSphereUFormer(nn.Module):
                 "AdaptiveSphereUFormer:",
                 f"coarse_rank={self.coarse_rank}",
                 f"fine_rank={self.fine_rank}",
-                f"Lc={self.coarse_fine_mapping.coarse_size}",
-                f"Lf={self.coarse_fine_mapping.fine_size}",
+                f"coarse_vertices={self.coarse_fine_hierarchy.coarse_vertex_count}",
+                f"fine_vertices={self.coarse_fine_hierarchy.fine_vertex_count}",
+                f"coarse_faces={self.coarse_fine_hierarchy.coarse_face_count}",
+                f"fine_faces={self.coarse_fine_hierarchy.fine_face_count}",
+                f"uncertainty_mean={uncertainty_scale.mean().item():.4f}",
+                f"uncertainty_max={uncertainty_scale.max().item():.4f}",
+                f"uncertainty_min={uncertainty_scale.min().item():.4f}",
                 f"refine_mean={refine_score.mean().item():.4f}",
                 f"refine_max={refine_score.max().item():.4f}",
                 f"refine_min={refine_score.min().item():.4f}",
-                f"gate_mean={fine_gate.mean().item():.4f}",
+                f"face_gate_mean={fine_face_gate.mean().item():.4f}",
+                f"vertex_gate_mean={fine_vertex_gate.mean().item():.4f}",
+                f"area_refine_ratio={area_refine_ratio.mean().item():.4f}",
             )
 
         return_aux = self.return_aux if return_aux is None else return_aux
@@ -1173,11 +1188,15 @@ class AdaptiveSphereUFormer(nn.Module):
         return {
             "saliency": saliency,
             "coarse_saliency": coarse_saliency,
+            "uncertainty": uncertainty_scale,
             "refine_score": refine_score,
             "fine_refine_score": fine_refine_score,
-            "gate_mean": fine_gate.mean(),
-            "gate_max": fine_gate.max(),
-            "gate_min": fine_gate.min(),
+            "fine_face_gate": fine_face_gate,
+            "fine_vertex_gate": fine_vertex_gate,
+            "area_refine_ratio": area_refine_ratio,
+            "gate_mean": area_refine_ratio.mean(),
+            "gate_max": fine_face_gate.max(),
+            "gate_min": fine_face_gate.min(),
         }
 
 
@@ -1229,7 +1248,13 @@ def build_saliency_model(args, node_type: Optional[str] = None) -> nn.Module:
         adaptive_coarse_depth=args.adaptive_coarse_depth,
         adaptive_fine_depth=args.adaptive_fine_depth,
         adaptive_temperature=args.adaptive_temperature,
+        adaptive_region_type=getattr(args, "adaptive_region_type", "face"),
+        coarse_pool_type=getattr(args, "coarse_pool_type", "mean_max"),
+        face_to_vertex_reduce=getattr(args, "face_to_vertex_reduce", "mean"),
         use_adaptive_refinement=args.use_adaptive_refinement,
+        use_uncertainty_refinement=getattr(
+            args, "use_uncertainty_refinement", True
+        ),
         use_motion_refinement=args.use_motion_refinement,
         return_aux=args.return_aux,
         debug_adaptive=args.debug_adaptive,

@@ -65,8 +65,21 @@ parser.add_argument("--coarse_rank_offset", type=int, default=2)
 parser.add_argument("--adaptive_coarse_depth", type=int, default=2)
 parser.add_argument("--adaptive_fine_depth", type=int, default=1)
 parser.add_argument("--adaptive_temperature", type=float, default=1.0)
+parser.add_argument(
+    "--adaptive_region_type", type=str, default="face", choices=["face"]
+)
+parser.add_argument(
+    "--coarse_pool_type",
+    type=str,
+    default="mean_max",
+    choices=["center", "mean", "mean_max"],
+)
+parser.add_argument(
+    "--face_to_vertex_reduce", type=str, default="mean", choices=["mean"]
+)
 parser.add_argument("--target_refine_ratio", type=float, default=0.25)
 parser.add_argument("--lambda_coarse", type=float, default=0.3)
+parser.add_argument("--lambda_uncertainty", type=float, default=0.1)
 parser.add_argument("--lambda_refine", type=float, default=0.2)
 parser.add_argument("--lambda_budget", type=float, default=0.05)
 parser.add_argument(
@@ -74,6 +87,12 @@ parser.add_argument(
     dest="use_adaptive_refinement",
     action="store_false",
     help="use a uniform gate of one for the coarse/fine architecture ablation",
+)
+parser.add_argument(
+    "--disable_uncertainty_refinement",
+    dest="use_uncertainty_refinement",
+    action="store_false",
+    help="predict uncertainty but do not feed it to the refinement head",
 )
 parser.add_argument(
     "--disable_motion_refinement",

@@ -37,11 +37,18 @@ class Trainer:
             adaptive_coarse_depth=args.adaptive_coarse_depth,
             adaptive_fine_depth=args.adaptive_fine_depth,
             adaptive_temperature=args.adaptive_temperature,
+            adaptive_region_type=getattr(args, "adaptive_region_type", "face"),
+            coarse_pool_type=getattr(args, "coarse_pool_type", "mean_max"),
+            face_to_vertex_reduce=getattr(args, "face_to_vertex_reduce", "mean"),
             target_refine_ratio=args.target_refine_ratio,
             lambda_coarse=args.lambda_coarse,
+            lambda_uncertainty=getattr(args, "lambda_uncertainty", 0.1),
             lambda_refine=args.lambda_refine,
             lambda_budget=args.lambda_budget,
             use_adaptive_refinement=args.use_adaptive_refinement,
+            use_uncertainty_refinement=getattr(
+                args, "use_uncertainty_refinement", True
+            ),
             use_motion_refinement=args.use_motion_refinement,
             use_budget_regularization=args.use_budget_regularization,
         )
@@ -121,7 +128,12 @@ class Trainer:
             raise ValueError("--temporal_window_radius must be non-negative")
         if not 0 <= args.target_refine_ratio <= 1:
             raise ValueError("--target_refine_ratio must be between 0 and 1")
-        if min(args.lambda_coarse, args.lambda_refine, args.lambda_budget) < 0:
+        if min(
+                args.lambda_coarse,
+                getattr(args, "lambda_uncertainty", 0.1),
+                args.lambda_refine,
+                args.lambda_budget,
+        ) < 0:
             raise ValueError("Adaptive loss weights must be non-negative")
 
         param_groups = self.get_optimizer_param_groups(args.weight_decay)
@@ -475,8 +487,11 @@ class Trainer:
         return kl_sphere_torch(pre_sal,gt_sal)
 
     @staticmethod
-    def normalize_refinement_target(difficulty):
-        """Normalize each frame's coarse difficulty to [0, 1]."""
+    def normalize_relative_refinement_target(difficulty):
+        """Build relative per-frame difficulty ranks for fixed-budget allocation.
+
+        This target is deliberately relative and is not predictive uncertainty.
+        """
         minimum = difficulty.amin(dim=-1, keepdim=True)
         maximum = difficulty.amax(dim=-1, keepdim=True)
         return (difficulty - minimum) / (maximum - minimum + 1e-8)
@@ -633,39 +648,53 @@ class Trainer:
         loss_rec = self.loss_kl_cc(pre_probs, gt_probs,gt_fix)/(B*T)
 
         loss_coarse = loss_rec.new_zeros(())
+        loss_uncertainty = loss_rec.new_zeros(())
         loss_refine = loss_rec.new_zeros(())
         loss_budget = loss_rec.new_zeros(())
         if adaptive_outputs is not None:
-            coarse_saliency_up = self.model.upsample_coarse_values_to_img(
-                adaptive_outputs["coarse_saliency"]
+            coarse_target = self.model.aggregate_img_values_to_coarse_faces(
+                gt_sal
             )
-            coarse_probs = coarse_saliency_up.reshape(B * T, L)
+            coarse_saliency = adaptive_outputs["coarse_saliency"]
+            coarse_face_count = coarse_saliency.shape[-1]
+            coarse_probs = coarse_saliency.reshape(B * T, coarse_face_count)
+            coarse_target_probs = coarse_target.reshape(B * T, coarse_face_count)
             loss_coarse = self.loss_kl_cc(
-                coarse_probs, gt_probs, gt_fix
+                coarse_probs, coarse_target_probs, gt_fix=None
             ) / (B * T)
 
+            uncertainty_scale = adaptive_outputs["uncertainty"]
+            laplace_nll = (
+                (coarse_target - coarse_saliency).abs() / uncertainty_scale
+                + torch.log(uncertainty_scale)
+            )
+            coarse_areas = self.model.coarse_fine_hierarchy.coarse_face_areas
+            coarse_area_weights = coarse_areas / coarse_areas.sum()
+            loss_uncertainty = (
+                laplace_nll * coarse_area_weights.reshape(1, 1, -1)
+            ).sum(dim=-1).mean()
+
             if self.args.use_adaptive_refinement:
-                difficulty_fine = (
-                    gt_sal - coarse_saliency_up.detach()
+                difficulty_target = (
+                    coarse_target - coarse_saliency.detach()
                 ).abs()
-                difficulty_coarse = self.model.aggregate_img_values_to_coarse(
-                    difficulty_fine
-                )
-                refinement_target = self.normalize_refinement_target(
-                    difficulty_coarse
+                relative_refinement_target = (
+                    self.normalize_relative_refinement_target(difficulty_target)
                 )
                 loss_refine = F.smooth_l1_loss(
-                    adaptive_outputs["refine_score"], refinement_target
+                    adaptive_outputs["refine_score"],
+                    relative_refinement_target,
                 )
                 if self.args.use_budget_regularization:
                     loss_budget = (
-                        adaptive_outputs["gate_mean"]
+                        adaptive_outputs["area_refine_ratio"]
                         - self.args.target_refine_ratio
-                    ).square()
+                    ).square().mean()
 
         total_loss = (
             loss_rec
             + self.args.lambda_coarse * loss_coarse
+            + getattr(self.args, "lambda_uncertainty", 0.1) * loss_uncertainty
             + self.args.lambda_refine * loss_refine
             + self.args.lambda_budget * loss_budget
         )
@@ -675,6 +704,7 @@ class Trainer:
             "loss": total_loss,
             "loss_saliency": loss_rec,
             "loss_coarse": loss_coarse,
+            "loss_uncertainty": loss_uncertainty,
             "loss_refine": loss_refine,
             "loss_budget": loss_budget,
         }
