@@ -9,7 +9,8 @@ import numpy as np
 import cv2
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
-          
+
+from adaptive_objectives import build_fixed_area_target
 from data.get_saliency_dataloaders import get_dataloaders         
 from network.sphere_model import build_saliency_model
 from Sphere_SalientScore_torch import *
@@ -35,12 +36,19 @@ class Trainer:
             model_type=args.model_type,
             coarse_rank_offset=args.coarse_rank_offset,
             adaptive_coarse_depth=args.adaptive_coarse_depth,
+            adaptive_middle_depth=getattr(args, "adaptive_middle_depth", 1),
             adaptive_fine_depth=args.adaptive_fine_depth,
             adaptive_temperature=args.adaptive_temperature,
             adaptive_region_type=getattr(args, "adaptive_region_type", "face"),
             coarse_pool_type=getattr(args, "coarse_pool_type", "mean_max"),
             face_to_vertex_reduce=getattr(args, "face_to_vertex_reduce", "mean"),
             target_refine_ratio=args.target_refine_ratio,
+            target_refine_ratio_l1=getattr(
+                args, "target_refine_ratio_l1", 0.25
+            ),
+            target_refine_ratio_l2=getattr(
+                args, "target_refine_ratio_l2", 0.125
+            ),
             lambda_coarse=args.lambda_coarse,
             lambda_uncertainty=getattr(args, "lambda_uncertainty", 0.1),
             lambda_refine=args.lambda_refine,
@@ -128,6 +136,13 @@ class Trainer:
             raise ValueError("--temporal_window_radius must be non-negative")
         if not 0 <= args.target_refine_ratio <= 1:
             raise ValueError("--target_refine_ratio must be between 0 and 1")
+        target_ratio_l1 = getattr(args, "target_refine_ratio_l1", 0.25)
+        target_ratio_l2 = getattr(args, "target_refine_ratio_l2", 0.125)
+        if not 0 <= target_ratio_l2 <= target_ratio_l1 <= 1:
+            raise ValueError(
+                "Expected 0 <= target_refine_ratio_l2 <= "
+                "target_refine_ratio_l1 <= 1"
+            )
         if min(
                 args.lambda_coarse,
                 getattr(args, "lambda_uncertainty", 0.1),
@@ -496,6 +511,125 @@ class Trainer:
         maximum = difficulty.amax(dim=-1, keepdim=True)
         return (difficulty - minimum) / (maximum - minimum + 1e-8)
 
+    @staticmethod
+    def area_weighted_mean(values, face_areas):
+        weights = face_areas.to(
+            device=values.device, dtype=values.dtype
+        )
+        weights = weights / weights.sum()
+        return (values * weights.reshape(1, 1, -1)).sum(dim=-1).mean()
+
+    @staticmethod
+    def area_weighted_masked_mean(values, face_areas, mask):
+        """Average within each sample's eligible spherical parent area."""
+        weights = face_areas.to(
+            device=values.device, dtype=values.dtype
+        ).reshape(1, 1, -1)
+        weights = weights * mask.to(dtype=values.dtype)
+        denominator = weights.sum(dim=-1)
+        numerator = (values * weights).sum(dim=-1)
+        per_sample = torch.where(
+            denominator > 0,
+            numerator / denominator.clamp_min(1e-8),
+            torch.zeros_like(numerator),
+        )
+        return per_sample.mean()
+
+    def compute_v2_losses(self, ground_truth, adaptive_outputs):
+        """Compute recursive fixed-budget losses without leaking GT to forward."""
+        B, T = ground_truth.shape[:2]
+        target_l4 = self.model.aggregate_img_values_to_l4_faces(ground_truth)
+        target_l5 = self.model.aggregate_img_values_to_l5_faces(ground_truth)
+        saliency_l4 = adaptive_outputs["saliency_l4"]
+        saliency_l5 = adaptive_outputs["saliency_l5"]
+        loss_saliency_l4 = self.loss_kl_cc(
+            saliency_l4.reshape(B * T, -1),
+            target_l4.reshape(B * T, -1),
+            gt_fix=None,
+        ) / (B * T)
+        loss_saliency_l5 = self.loss_kl_cc(
+            saliency_l5.reshape(B * T, -1),
+            target_l5.reshape(B * T, -1),
+            gt_fix=None,
+        ) / (B * T)
+
+        uncertainty_l4 = adaptive_outputs["uncertainty_l4"]
+        uncertainty_l5 = adaptive_outputs["uncertainty_l5"]
+        laplace_l4 = (
+            (target_l4 - saliency_l4).abs() / uncertainty_l4
+            + torch.log(uncertainty_l4)
+        )
+        laplace_l5 = (
+            (target_l5 - saliency_l5).abs() / uncertainty_l5
+            + torch.log(uncertainty_l5)
+        )
+        loss_uncertainty_l4 = self.area_weighted_mean(
+            laplace_l4, self.model.hierarchy_l4_l5.coarse_face_areas
+        )
+        loss_uncertainty_l5 = self.area_weighted_mean(
+            laplace_l5, self.model.hierarchy_l5_l6.coarse_face_areas
+        )
+
+        difficulty_l4 = (target_l4 - saliency_l4.detach()).abs()
+        target_ratio_l1 = getattr(
+            self.args, "target_refine_ratio_l1", 0.25
+        )
+        target_ratio_l2 = getattr(
+            self.args, "target_refine_ratio_l2", 0.125
+        )
+        selection_target_l4 = build_fixed_area_target(
+            difficulty_l4,
+            self.model.hierarchy_l4_l5.coarse_face_areas,
+            target_ratio_l1,
+        )
+        eligible_l5 = self.model.hierarchy_l4_l5.propagate_coarse_face_values(
+            selection_target_l4
+        ).bool()
+        difficulty_l5 = (target_l5 - saliency_l5.detach()).abs()
+        selection_target_l5 = build_fixed_area_target(
+            difficulty_l5,
+            self.model.hierarchy_l5_l6.coarse_face_areas,
+            target_ratio_l2,
+            eligible_mask=eligible_l5,
+        )
+
+        refine_bce_l4 = F.binary_cross_entropy_with_logits(
+            adaptive_outputs["refine_logits_l4"],
+            selection_target_l4,
+            reduction="none",
+        )
+        refine_bce_l5 = F.binary_cross_entropy_with_logits(
+            adaptive_outputs["refine_logits_l5"],
+            selection_target_l5,
+            reduction="none",
+        )
+        loss_refine_l4 = self.area_weighted_mean(
+            refine_bce_l4, self.model.hierarchy_l4_l5.coarse_face_areas
+        )
+        loss_refine_l5 = self.area_weighted_masked_mean(
+            refine_bce_l5,
+            self.model.hierarchy_l5_l6.coarse_face_areas,
+            eligible_l5,
+        )
+        loss_budget_l1 = (
+            adaptive_outputs["area_ratio_l1"] - target_ratio_l1
+        ).square().mean()
+        loss_budget_l2 = (
+            adaptive_outputs["area_ratio_l2"] - target_ratio_l2
+        ).square().mean()
+        return {
+            "loss_saliency_l4": loss_saliency_l4,
+            "loss_saliency_l5": loss_saliency_l5,
+            "loss_uncertainty_l4": loss_uncertainty_l4,
+            "loss_uncertainty_l5": loss_uncertainty_l5,
+            "loss_refine_l4": loss_refine_l4,
+            "loss_refine_l5": loss_refine_l5,
+            "loss_budget_l1": loss_budget_l1,
+            "loss_budget_l2": loss_budget_l2,
+            "selection_target_l4": selection_target_l4,
+            "selection_target_l5": selection_target_l5,
+        }
+
     def train_one_epoch(self):
         """训练单个epoch"""
         self.model.train()
@@ -630,7 +764,9 @@ class Trainer:
         gt_sal = inputs["normalized_sphere_sal"]
         gt_fix = inputs["normalized_sphere_fix"]
 
-        adaptive = self.args.model_type == "adaptive_sphere_uformer"
+        adaptive_v1 = self.args.model_type == "adaptive_sphere_uformer"
+        adaptive_v2 = self.args.model_type == "adaptive_sphere_uformer_v2"
+        adaptive = adaptive_v1 or adaptive_v2
         if adaptive:
             adaptive_outputs = self.model(x, return_aux=True)
             pred_sal = adaptive_outputs["saliency"]
@@ -651,7 +787,28 @@ class Trainer:
         loss_uncertainty = loss_rec.new_zeros(())
         loss_refine = loss_rec.new_zeros(())
         loss_budget = loss_rec.new_zeros(())
-        if adaptive_outputs is not None:
+        v2_losses = {}
+        if adaptive_v2:
+            v2_losses = self.compute_v2_losses(gt_sal, adaptive_outputs)
+            loss_coarse = 0.5 * (
+                v2_losses["loss_saliency_l4"]
+                + v2_losses["loss_saliency_l5"]
+            )
+            loss_uncertainty = 0.5 * (
+                v2_losses["loss_uncertainty_l4"]
+                + v2_losses["loss_uncertainty_l5"]
+            )
+            if self.args.use_adaptive_refinement:
+                loss_refine = 0.5 * (
+                    v2_losses["loss_refine_l4"]
+                    + v2_losses["loss_refine_l5"]
+                )
+                if self.args.use_budget_regularization:
+                    loss_budget = 0.5 * (
+                        v2_losses["loss_budget_l1"]
+                        + v2_losses["loss_budget_l2"]
+                    )
+        elif adaptive_outputs is not None:
             coarse_target = self.model.aggregate_img_values_to_coarse_faces(
                 gt_sal
             )
@@ -708,6 +865,11 @@ class Trainer:
             "loss_refine": loss_refine,
             "loss_budget": loss_budget,
         }
+        losses.update({
+            name: value
+            for name, value in v2_losses.items()
+            if name.startswith("loss_")
+        })
         return outputs, losses
 
     def save_model(self):

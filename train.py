@@ -59,10 +59,15 @@ parser.add_argument(
     "--model_type",
     type=str,
     default="sphere_uformer",
-    choices=["sphere_uformer", "adaptive_sphere_uformer"],
+    choices=[
+        "sphere_uformer",
+        "adaptive_sphere_uformer",
+        "adaptive_sphere_uformer_v2",
+    ],
 )
 parser.add_argument("--coarse_rank_offset", type=int, default=2)
 parser.add_argument("--adaptive_coarse_depth", type=int, default=2)
+parser.add_argument("--adaptive_middle_depth", type=int, default=1)
 parser.add_argument("--adaptive_fine_depth", type=int, default=1)
 parser.add_argument("--adaptive_temperature", type=float, default=1.0)
 parser.add_argument(
@@ -78,6 +83,8 @@ parser.add_argument(
     "--face_to_vertex_reduce", type=str, default="mean", choices=["mean"]
 )
 parser.add_argument("--target_refine_ratio", type=float, default=0.25)
+parser.add_argument("--target_refine_ratio_l1", type=float, default=0.25)
+parser.add_argument("--target_refine_ratio_l2", type=float, default=0.125)
 parser.add_argument("--lambda_coarse", type=float, default=0.3)
 parser.add_argument("--lambda_uncertainty", type=float, default=0.1)
 parser.add_argument("--lambda_refine", type=float, default=0.2)
@@ -237,11 +244,15 @@ CUDA_VISIBLE_DEVICES=4 python /home/dyz/PythonProject/Test_Codes/Sampling_test/t
     --lr_scheduler reduce_on_plateau \
     --rel_pos_init_variance 0 \
     --coarse_rank_offset 2 \
-    --adaptive_coarse_depth 2 \
+     --adaptive_coarse_depth 2 \
     --adaptive_fine_depth 1 \
     --adaptive_temperature 1.0 \
+    --adaptive_region_type face \
+    --coarse_pool_type mean_max \
+    --face_to_vertex_reduce mean \
     --target_refine_ratio 0.25 \
     --lambda_coarse 0.3 \
+    --lambda_uncertainty 0.1 \
     --lambda_refine 0.2 \
     --lambda_budget 0.05 \
     --log_dir /home/dyz/PythonProject/Test_Codes/Sampling_test/log \

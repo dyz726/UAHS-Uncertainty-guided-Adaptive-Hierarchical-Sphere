@@ -1200,6 +1200,438 @@ class AdaptiveSphereUFormer(nn.Module):
         }
 
 
+class AdaptiveSphereUFormerV2(nn.Module):
+    """Dense rank-(r-2)->(r-1)->r uncertainty-guided hierarchy.
+
+    Every refinement candidate reads raw RGB sampled directly from the original
+    rank-r input. Upsampled lower-rank features provide context only. The dense
+    rank-(r-1) and rank-r encoders remain active regardless of gate values, so
+    this class does not claim sparse FLOP reduction.
+    """
+
+    def __init__(
+            self,
+            img_rank: int,
+            node_type: str,
+            in_channels: int = 3,
+            out_channels: int = 1,
+            embed_dim: int = 32,
+            in_scale_factor: int = 2,
+            d_head_coef: int = 1,
+            num_heads: int = 2,
+            win_size_coef: int = 1,
+            temporal_window_radius: int = 5,
+            mlp_ratio: float = 4.,
+            qkv_bias: bool = True,
+            qk_scale=None,
+            attn_drop_rate: float = 0.,
+            attn_out_drop_rate: float = 0.,
+            drop_rate: float = 0.,
+            drop_path_rate: float = 0.,
+            pos_drop_rate: float = 0.,
+            act_layer=nn.GELU,
+            norm_layer=nn.LayerNorm,
+            use_checkpoint: bool = False,
+            abs_pos_enc_in: bool = True,
+            abs_pos_enc: bool = True,
+            rel_pos_bias: bool = True,
+            rel_pos_bias_size: int = 7,
+            rel_pos_init_variance: float = 0.,
+            debug_skip_attn: bool = False,
+            append_self: bool = False,
+            adaptive_coarse_depth: int = 2,
+            adaptive_middle_depth: int = 1,
+            adaptive_fine_depth: int = 1,
+            adaptive_temperature: float = 1.0,
+            adaptive_region_type: str = "face",
+            coarse_pool_type: str = "mean_max",
+            face_to_vertex_reduce: str = "mean",
+            use_adaptive_refinement: bool = True,
+            use_uncertainty_refinement: bool = True,
+            use_motion_refinement: bool = True,
+            return_aux: bool = False,
+            debug_adaptive: bool = False,
+    ):
+        super().__init__()
+        del in_scale_factor  # V2 always consumes raw image-rank features.
+        if img_rank < 2:
+            raise ValueError("UAHS-V2 requires img_rank >= 2")
+        if min(
+                adaptive_coarse_depth,
+                adaptive_middle_depth,
+                adaptive_fine_depth,
+        ) < 1:
+            raise ValueError("All UAHS-V2 encoder depths must be positive")
+        if embed_dim % num_heads:
+            raise ValueError("embed_dim must be divisible by num_heads")
+        if node_type != "vertex":
+            raise ValueError("UAHS-V2 keeps a vertex backbone; use --mode vertex")
+        if adaptive_region_type != "face":
+            raise ValueError("UAHS-V2 only supports face-guided regions")
+        if face_to_vertex_reduce != "mean":
+            raise ValueError("Only face_to_vertex_reduce='mean' is implemented")
+
+        self.img_rank = img_rank
+        self.fine_rank = img_rank
+        self.middle_rank = img_rank - 1
+        self.coarse_rank = img_rank - 2
+        self.proj_rank = self.middle_rank
+        self.embed_dim = embed_dim
+        self.out_channels = out_channels
+        self.use_adaptive_refinement = use_adaptive_refinement
+        self.return_aux = return_aux
+        self.debug_adaptive = debug_adaptive
+        self.icosphere_ref = IcoSphereRef(node_type=node_type)
+
+        # Exact 1-to-4 adjacent hierarchies plus a direct 1-to-16 mapping used
+        # only to pool the raw rank-r input into the coarse encoder.
+        self.hierarchy_l4_l5 = IcoSphereHierarchy(
+            self.coarse_rank, self.middle_rank, self.icosphere_ref
+        )
+        self.hierarchy_l5_l6 = IcoSphereHierarchy(
+            self.middle_rank, self.fine_rank, self.icosphere_ref
+        )
+        self.hierarchy_l4_l6 = IcoSphereHierarchy(
+            self.coarse_rank, self.fine_rank, self.icosphere_ref
+        )
+        self.upsample_l4_l5 = InterpolateUpsample(
+            self.coarse_rank, self.middle_rank, self.icosphere_ref
+        )
+        self.upsample_l5_l6 = InterpolateUpsample(
+            self.middle_rank, self.fine_rank, self.icosphere_ref
+        )
+
+        self.input_proj_l5 = InputProj(
+            in_channels, embed_dim, act_layer=act_layer
+        )
+        self.input_proj_l6 = InputProj(
+            in_channels, embed_dim, act_layer=act_layer
+        )
+        self.coarse_region_pool = HierarchicalRegionPool(
+            embed_dim, pool_type=coarse_pool_type
+        )
+        self.context_projection_l5 = nn.Linear(embed_dim, embed_dim)
+        self.context_projection_l6 = nn.Linear(embed_dim, embed_dim)
+        self.apply_abs_pos_enc_in = abs_pos_enc_in
+        if abs_pos_enc_in:
+            self.abs_pos_l4 = self._build_input_position_encoding(
+                self.coarse_rank, embed_dim
+            )
+            self.abs_pos_l5 = self._build_input_position_encoding(
+                self.middle_rank, embed_dim
+            )
+            self.abs_pos_l6 = self._build_input_position_encoding(
+                self.fine_rank, embed_dim
+            )
+        self.pos_drop = nn.Dropout(pos_drop_rate)
+
+        common_module_args = dict(
+            icosphere_ref=self.icosphere_ref,
+            dim=embed_dim,
+            num_heads=num_heads,
+            d_head_coef=d_head_coef,
+            win_size_coef=win_size_coef,
+            temporal_window_radius=temporal_window_radius,
+            mlp_ratio=mlp_ratio,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            attn_drop=attn_drop_rate,
+            attn_out_drop=attn_out_drop_rate,
+            mlp_drop=drop_rate,
+            drop_path=drop_path_rate,
+            act_layer=act_layer,
+            norm_layer=norm_layer,
+            use_checkpoint=use_checkpoint,
+            abs_pos_enc=abs_pos_enc,
+            rel_pos_bias=rel_pos_bias,
+            rel_pos_bias_size=rel_pos_bias_size,
+            rel_pos_init_variance=rel_pos_init_variance,
+            debug_skip_attn=debug_skip_attn,
+            append_self=append_self,
+        )
+        self.coarse_encoder = SphereUFormerModule(
+            rank=self.coarse_rank,
+            depth=adaptive_coarse_depth,
+            **common_module_args,
+        )
+        self.rank5_encoder = SphereUFormerModule(
+            rank=self.middle_rank,
+            depth=adaptive_middle_depth,
+            **common_module_args,
+        )
+        self.rank6_encoder = SphereUFormerModule(
+            rank=self.fine_rank,
+            depth=adaptive_fine_depth,
+            **common_module_args,
+        )
+
+        self.vertex_to_face_l4 = VertexToFaceAggregation(embed_dim)
+        self.vertex_to_face_l5 = VertexToFaceAggregation(embed_dim)
+        self.saliency_head_l4 = nn.Linear(embed_dim, out_channels)
+        self.saliency_head_l5 = nn.Linear(embed_dim, out_channels)
+        self.uncertainty_head_l4 = SphericalUncertaintyHead(embed_dim)
+        self.uncertainty_head_l5 = SphericalUncertaintyHead(embed_dim)
+        self.refinement_head_l4 = AdaptiveRefinementHead(
+            embed_dim,
+            use_uncertainty=use_uncertainty_refinement,
+            use_motion=use_motion_refinement,
+        )
+        self.refinement_head_l5 = AdaptiveRefinementHead(
+            embed_dim,
+            use_uncertainty=use_uncertainty_refinement,
+            use_motion=use_motion_refinement,
+        )
+        self.region_selector_l4 = AdaptiveRegionSelector(adaptive_temperature)
+        self.region_selector_l5 = AdaptiveRegionSelector(adaptive_temperature)
+        self.fusion_norm_l5 = norm_layer(embed_dim)
+        self.fusion_norm_l6 = norm_layer(embed_dim)
+        self.output_proj = OutputProj(embed_dim, out_channels)
+        self.final_sigmoid = nn.Sigmoid()
+        self.apply(self._init_weights)
+
+    def _build_input_position_encoding(self, rank, embed_dim):
+        return nn.Sequential(
+            GlobalVerticalPositionEnconding(
+                rank=rank,
+                icosphere_ref=self.icosphere_ref,
+                mode="phi",
+                num_pos_feats=16,
+                max_frequency=10000,
+                min_frequency=1,
+            ),
+            nn.Linear(32, embed_dim, bias=False),
+        )
+
+    @staticmethod
+    def _init_weights(module):
+        if isinstance(module, nn.Linear):
+            trunc_normal_(module.weight, std=.02)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.constant_(module.bias, 0)
+            nn.init.constant_(module.weight, 1.0)
+
+    @staticmethod
+    def _validate_gate_override(gate, reference, name):
+        if gate.shape != reference.shape:
+            raise ValueError(
+                f"{name} must have shape {tuple(reference.shape)}, "
+                f"got {tuple(gate.shape)}"
+            )
+        return gate.to(device=reference.device, dtype=reference.dtype).clamp(0, 1)
+
+    def aggregate_img_values_to_l5_faces(self, values: Tensor) -> Tensor:
+        rank6_faces = self.hierarchy_l5_l6.vertex_values_to_faces(
+            values, level="fine"
+        )
+        return self.hierarchy_l5_l6.aggregate_fine_face_values(
+            rank6_faces, area_weighted=True
+        )
+
+    def aggregate_img_values_to_l4_faces(self, values: Tensor) -> Tensor:
+        rank5_faces = self.aggregate_img_values_to_l5_faces(values)
+        return self.hierarchy_l4_l5.aggregate_fine_face_values(
+            rank5_faces, area_weighted=True
+        )
+
+    def aggregate_img_values_to_coarse_faces(self, values: Tensor) -> Tensor:
+        return self.aggregate_img_values_to_l4_faces(values)
+
+    def upsample_l5_values_to_img(self, values: Tensor) -> Tensor:
+        rank6_faces = self.hierarchy_l5_l6.propagate_coarse_face_values(values)
+        return self.hierarchy_l5_l6.fine_face_values_to_vertices(rank6_faces)
+
+    def upsample_l4_values_to_img(self, values: Tensor) -> Tensor:
+        rank5_faces = self.hierarchy_l4_l5.propagate_coarse_face_values(values)
+        return self.upsample_l5_values_to_img(rank5_faces)
+
+    def upsample_coarse_values_to_img(self, values: Tensor) -> Tensor:
+        return self.upsample_l4_values_to_img(values)
+
+    def forward(
+            self,
+            x: Tensor,
+            return_aux: Optional[bool] = None,
+            gate_overrides: Optional[dict] = None,
+    ):
+        """Predict saliency from rank-r RGB without using labels.
+
+        ``gate_overrides`` is an evaluation-only interface containing optional
+        rank-4 ``l4`` and rank-5 ``l5_local`` face gates. It never derives gates
+        from ground truth inside the model.
+        """
+        if x.ndim != 4:
+            raise ValueError(f"Expected [B, T, L, C], got {tuple(x.shape)}")
+        B, T, L_img, channels = x.shape
+        if L_img != self.hierarchy_l5_l6.fine_vertex_count:
+            raise ValueError(
+                f"img_rank={self.img_rank} expects "
+                f"{self.hierarchy_l5_l6.fine_vertex_count} vertices, got {L_img}"
+            )
+        flat_img = x.reshape(B * T, L_img, channels)
+
+        # Both detail streams originate from the original rank-r RGB.
+        raw_rgb_l5 = self.hierarchy_l5_l6.center_downsample_vertices(flat_img)
+        raw_features_l5 = self.input_proj_l5(raw_rgb_l5)
+        raw_features_l6 = self.input_proj_l6(flat_img)
+        coarse_features = self.coarse_region_pool(
+            raw_features_l6, self.hierarchy_l4_l6
+        )
+        if self.apply_abs_pos_enc_in:
+            coarse_features = coarse_features + self.abs_pos_l4(coarse_features)
+            raw_features_l5 = raw_features_l5 + self.abs_pos_l5(raw_features_l5)
+            raw_features_l6 = raw_features_l6 + self.abs_pos_l6(raw_features_l6)
+        coarse_features = self.coarse_encoder(
+            self.pos_drop(coarse_features), time_steps=T
+        )
+
+        face_features_l4 = self.vertex_to_face_l4(
+            coarse_features, self.hierarchy_l4_l5
+        )
+        face_features_l4_bt = face_features_l4.reshape(
+            B, T, self.hierarchy_l4_l5.coarse_face_count, self.embed_dim
+        )
+        saliency_l4 = self.final_sigmoid(
+            self.saliency_head_l4(face_features_l4)
+        ).squeeze(-1).reshape(B, T, -1)
+        uncertainty_l4 = self.uncertainty_head_l4(face_features_l4_bt)
+        refine_logits_l4, refine_score_l4 = self.refinement_head_l4(
+            face_features_l4_bt, uncertainty_l4
+        )
+        gate_l4_parent = self.region_selector_l4(
+            refine_logits_l4, enabled=self.use_adaptive_refinement
+        )
+        if gate_overrides and "l4" in gate_overrides:
+            gate_l4_parent = self._validate_gate_override(
+                gate_overrides["l4"], gate_l4_parent, "gate_overrides['l4']"
+            )
+        gate_l4_to_l5 = self.hierarchy_l4_l5.propagate_coarse_face_values(
+            gate_l4_parent
+        )
+        vertex_gate_l5 = self.hierarchy_l4_l5.fine_face_values_to_vertices(
+            gate_l4_to_l5
+        )
+
+        context_l5 = self.upsample_l4_l5(coarse_features)
+        candidate_l5 = self.rank5_encoder(
+            self.pos_drop(
+                raw_features_l5 + self.context_projection_l5(context_l5)
+            ),
+            time_steps=T,
+        )
+        fused_l5 = self.fusion_norm_l5(
+            context_l5
+            + vertex_gate_l5.reshape(B * T, -1, 1)
+            * (candidate_l5 - context_l5)
+        )
+
+        face_features_l5 = self.vertex_to_face_l5(
+            fused_l5, self.hierarchy_l5_l6
+        )
+        face_features_l5_bt = face_features_l5.reshape(
+            B, T, self.hierarchy_l5_l6.coarse_face_count, self.embed_dim
+        )
+        saliency_l5 = self.final_sigmoid(
+            self.saliency_head_l5(face_features_l5)
+        ).squeeze(-1).reshape(B, T, -1)
+        uncertainty_l5 = self.uncertainty_head_l5(face_features_l5_bt)
+        refine_logits_l5, refine_score_l5 = self.refinement_head_l5(
+            face_features_l5_bt, uncertainty_l5
+        )
+        gate_l5_local = self.region_selector_l5(
+            refine_logits_l5, enabled=self.use_adaptive_refinement
+        )
+        if gate_overrides and "l5_local" in gate_overrides:
+            gate_l5_local = self._validate_gate_override(
+                gate_overrides["l5_local"],
+                gate_l5_local,
+                "gate_overrides['l5_local']",
+            )
+
+        # A rank-5 child can only refine when its exact rank-4 parent is active.
+        gate_l5_effective_parent = gate_l4_to_l5 * gate_l5_local
+        gate_l5_local_fine = self.hierarchy_l5_l6.propagate_coarse_face_values(
+            gate_l5_local
+        )
+        gate_l5_to_l6_effective = (
+            self.hierarchy_l5_l6.propagate_coarse_face_values(
+                gate_l5_effective_parent
+            )
+        )
+        vertex_gate_l6 = self.hierarchy_l5_l6.fine_face_values_to_vertices(
+            gate_l5_to_l6_effective
+        )
+
+        context_l6 = self.upsample_l5_l6(fused_l5)
+        candidate_l6 = self.rank6_encoder(
+            self.pos_drop(
+                raw_features_l6 + self.context_projection_l6(context_l6)
+            ),
+            time_steps=T,
+        )
+        fused_l6 = self.fusion_norm_l6(
+            context_l6
+            + vertex_gate_l6.reshape(B * T, -1, 1)
+            * (candidate_l6 - context_l6)
+        )
+        final_logits = self.output_proj(fused_l6)
+        if self.out_channels == 1:
+            saliency = self.final_sigmoid(
+                final_logits.squeeze(-1).reshape(B, T, L_img)
+            )
+        else:
+            saliency = self.final_sigmoid(
+                final_logits.reshape(B, T, L_img, self.out_channels)
+            )
+
+        area_ratio_l1 = self.hierarchy_l4_l5.area_weighted_fine_face_ratio(
+            gate_l4_to_l5
+        )
+        area_ratio_l2 = self.hierarchy_l5_l6.area_weighted_fine_face_ratio(
+            gate_l5_to_l6_effective
+        )
+        if self.debug_adaptive:
+            print(
+                "AdaptiveSphereUFormerV2:",
+                f"ranks={self.coarse_rank}->{self.middle_rank}->{self.fine_rank}",
+                f"vertices={self.hierarchy_l4_l5.coarse_vertex_count}->"
+                f"{self.hierarchy_l4_l5.fine_vertex_count}->"
+                f"{self.hierarchy_l5_l6.fine_vertex_count}",
+                f"faces={self.hierarchy_l4_l5.coarse_face_count}->"
+                f"{self.hierarchy_l4_l5.fine_face_count}->"
+                f"{self.hierarchy_l5_l6.fine_face_count}",
+                f"uncertainty_l4={uncertainty_l4.mean().item():.4f}",
+                f"uncertainty_l5={uncertainty_l5.mean().item():.4f}",
+                f"area_l1={area_ratio_l1.mean().item():.4f}",
+                f"area_l2={area_ratio_l2.mean().item():.4f}",
+            )
+
+        return_aux = self.return_aux if return_aux is None else return_aux
+        if not return_aux:
+            return saliency
+        return {
+            "saliency": saliency,
+            "saliency_l4": saliency_l4,
+            "uncertainty_l4": uncertainty_l4,
+            "refine_logits_l4": refine_logits_l4,
+            "refine_score_l4": refine_score_l4,
+            "gate_l4_parent": gate_l4_parent,
+            "gate_l4_to_l5": gate_l4_to_l5,
+            "vertex_gate_l5": vertex_gate_l5,
+            "area_ratio_l1": area_ratio_l1,
+            "saliency_l5": saliency_l5,
+            "uncertainty_l5": uncertainty_l5,
+            "refine_logits_l5": refine_logits_l5,
+            "refine_score_l5": refine_score_l5,
+            "gate_l5_to_l6_local": gate_l5_local,
+            "gate_l5_to_l6_local_fine": gate_l5_local_fine,
+            "gate_l5_to_l6_effective": gate_l5_to_l6_effective,
+            "vertex_gate_l6": vertex_gate_l6,
+            "area_ratio_l2": area_ratio_l2,
+        }
+
+
 def build_saliency_model(args, node_type: Optional[str] = None) -> nn.Module:
     """Build the configured baseline or adaptive saliency model."""
     node_type = node_type or args.mode
@@ -1238,6 +1670,25 @@ def build_saliency_model(args, node_type: Optional[str] = None) -> nn.Module:
             dec_num_heads=args.dec_num_heads,
             downsample=args.downsample,
             upsample=args.upsample,
+            **common,
+        )
+    if model_type == "adaptive_sphere_uformer_v2":
+        return AdaptiveSphereUFormerV2(
+            num_heads=args.enc_num_heads[0],
+            adaptive_coarse_depth=args.adaptive_coarse_depth,
+            adaptive_middle_depth=getattr(args, "adaptive_middle_depth", 1),
+            adaptive_fine_depth=args.adaptive_fine_depth,
+            adaptive_temperature=args.adaptive_temperature,
+            adaptive_region_type=getattr(args, "adaptive_region_type", "face"),
+            coarse_pool_type=getattr(args, "coarse_pool_type", "mean_max"),
+            face_to_vertex_reduce=getattr(args, "face_to_vertex_reduce", "mean"),
+            use_adaptive_refinement=args.use_adaptive_refinement,
+            use_uncertainty_refinement=getattr(
+                args, "use_uncertainty_refinement", True
+            ),
+            use_motion_refinement=args.use_motion_refinement,
+            return_aux=args.return_aux,
+            debug_adaptive=args.debug_adaptive,
             **common,
         )
     if model_type != "adaptive_sphere_uformer":
