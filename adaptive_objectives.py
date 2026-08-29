@@ -16,16 +16,29 @@ def build_fixed_area_target(
         scores: Tensor shaped ``[..., F]``. Higher values are selected first.
         face_areas: Positive spherical areas shaped ``[F]``.
         target_ratio: Desired fraction of the complete sphere, not merely the
-            eligible subset.
+            eligible subset. May be a scalar or a tensor broadcastable to the
+            leading dimensions of ``scores`` for per-frame matched budgets.
         eligible_mask: Optional boolean tensor shaped like ``scores``. Faces
             outside this mask can never be selected.
     """
     if scores.shape[-1] != face_areas.numel():
         raise ValueError("scores and face_areas have different face counts")
-    if not 0 <= target_ratio <= 1:
-        raise ValueError("target_ratio must be between zero and one")
     if bool((face_areas <= 0).any()):
         raise ValueError("face_areas must be positive")
+
+    ratio = torch.as_tensor(
+        target_ratio, device=scores.device, dtype=scores.dtype
+    ).detach()
+    try:
+        ratio = torch.ones(
+            scores.shape[:-1], device=scores.device, dtype=scores.dtype
+        ) * ratio
+    except RuntimeError as error:
+        raise ValueError(
+            "target_ratio must be scalar or broadcastable to scores.shape[:-1]"
+        ) from error
+    if bool(((ratio < 0) | (ratio > 1)).any()):
+        raise ValueError("target_ratio must be between zero and one")
 
     flat_scores = scores.detach().reshape(-1, scores.shape[-1])
     if eligible_mask is None:
@@ -44,7 +57,7 @@ def build_fixed_area_target(
         (cumulative_area.new_zeros((cumulative_area.shape[0], 1)), cumulative_area),
         dim=-1,
     )
-    target_area = float(target_ratio) * areas.sum()
+    target_area = ratio.reshape(-1, 1) * areas.sum()
     selected_count = (area_options - target_area).abs().argmin(dim=-1)
     positions = torch.arange(
         flat_scores.shape[-1], device=scores.device

@@ -11,10 +11,7 @@ EVALUATE_DIR = os.path.join(os.path.dirname(__file__), "evaluate")
 if EVALUATE_DIR not in sys.path:
     sys.path.insert(0, EVALUATE_DIR)
 
-from adaptive_diagnostics import (
-    AdaptiveDiagnosticsAccumulator,
-    AdaptiveDiagnosticsAccumulatorV2,
-)
+from adaptive_diagnostics import UAHSDiagnosticsAccumulator
 from adaptive_objectives import build_fixed_area_target
 from data.get_saliency_dataloaders import get_dataloaders
 from evaluation import evaluate_saliency_maps_in_folder
@@ -49,62 +46,32 @@ class InferenceRunner:
             dataset_split=args.avs_split,
         )
 
-        # Inference accepts both the unchanged baseline and adaptive checkpoints.
+        # Inference accepts the unchanged baseline and final UAHS checkpoints.
         args.use_checkpoint = False
         self.model = build_saliency_model(args)
         self._load_weights(args.base_model_weights)
         self.model.to(self.device).eval()
-        adaptive_model_types = {
-            "adaptive_sphere_uformer",
-            "adaptive_sphere_uformer_v2",
-        }
-        if args.adaptive_diagnostics and args.model_type not in adaptive_model_types:
-            raise ValueError(
-                "--adaptive_diagnostics requires an adaptive model_type"
-            )
-        if (
-                args.compare_uniform_gate or args.compare_gate_baselines
-        ) and not args.use_adaptive_refinement:
-            raise ValueError(
-                "--compare_uniform_gate cannot be combined with "
-                "--disable_adaptive_refinement"
-            )
-        if args.compare_gate_baselines and (
-                args.model_type != "adaptive_sphere_uformer_v2"
-        ):
-            raise ValueError(
-                "--compare_gate_baselines currently requires UAHS-V2"
-            )
-        if args.model_type == "adaptive_sphere_uformer_v2" and not (
+        comparison_modes = getattr(args, "selector_comparison_modes", None) or []
+        if args.uahs_diagnostics and args.model_type != "uahs":
+            raise ValueError("--uahs_diagnostics requires --model_type uahs")
+        if comparison_modes and args.model_type != "uahs":
+            raise ValueError("selector comparisons require --model_type uahs")
+        if args.model_type == "uahs" and not (
                 0 <= args.target_refine_ratio_l2
                 <= args.target_refine_ratio_l1 <= 1
         ):
             raise ValueError(
-                "UAHS-V2 requires 0 <= target_refine_ratio_l2 "
+                "UAHS requires 0 <= target_refine_ratio_l2 "
                 "<= target_refine_ratio_l1 <= 1"
             )
-        if not args.adaptive_diagnostics:
-            self.adaptive_diagnostics = None
-        elif args.model_type == "adaptive_sphere_uformer_v2":
-            self.adaptive_diagnostics = AdaptiveDiagnosticsAccumulatorV2(
+        if args.uahs_diagnostics:
+            self.uahs_diagnostics = UAHSDiagnosticsAccumulator(
                 args.target_refine_ratio_l1,
                 args.target_refine_ratio_l2,
             )
         else:
-            self.adaptive_diagnostics = AdaptiveDiagnosticsAccumulator(
-                args.target_refine_ratio
-            )
-        self.comparison_modes = []
-        if args.compare_uniform_gate:
-            self.comparison_modes.append("full_fine")
-        if args.compare_gate_baselines:
-            self.comparison_modes.extend((
-                "full_fine",
-                "uniform_same_budget",
-                "random_same_budget",
-                "oracle_error_selection",
-            ))
-        self.comparison_modes = list(dict.fromkeys(self.comparison_modes))
+            self.uahs_diagnostics = None
+        self.comparison_modes = list(dict.fromkeys(comparison_modes))
 
         sphere_ref = IcoSphereRef(args.mode)
         spherical = asSpherical(sphere_ref.get_normals(rank=args.img_rank))
@@ -129,22 +96,14 @@ class InferenceRunner:
             (key[7:] if key.startswith("module.") else key): value
             for key, value in state_dict.items()
         }
-        model_state = self.model.state_dict()
-        compatible = {
-            key: value
-            for key, value in state_dict.items()
-            if key in model_state and value.shape == model_state[key].shape
-        }
-        if not compatible:
-            raise RuntimeError(f"No compatible parameters found in {path}")
-        model_state.update(compatible)
-        self.model.load_state_dict(model_state)
-        print(f"Loaded {len(compatible)}/{len(model_state)} model tensors from {path}")
-        if len(compatible) != len(model_state):
-            print(
-                "Warning: the checkpoint does not fully match this model; unmatched "
-                "layers keep their random initialization, so metrics are not reliable."
-            )
+        try:
+            self.model.load_state_dict(state_dict, strict=True)
+        except RuntimeError as error:
+            raise RuntimeError(
+                "Checkpoint does not exactly match the selected final model. "
+                "Legacy adaptive checkpoints are intentionally unsupported."
+            ) from error
+        print(f"Loaded {len(state_dict)} model tensors from {path}")
 
     def _to_device(self, batch):
         return {
@@ -299,102 +258,56 @@ class InferenceRunner:
             if metric_frames[name]
         }
 
-    def _build_v2_gate_overrides(
+    def _build_oracle_masks(
             self,
-            mode,
-            adaptive_outputs,
+            learned_outputs,
             ground_truth,
-            batch_index,
             rgb,
     ):
-        reference_l4 = adaptive_outputs["gate_l4_parent"]
-        reference_l5 = adaptive_outputs["gate_l5_to_l6_local"]
-        ratio_l1 = self.args.target_refine_ratio_l1
-        ratio_l2 = self.args.target_refine_ratio_l2
-        if mode == "full_fine":
-            return {
-                "l4": torch.ones_like(reference_l4),
-                "l5_local": torch.ones_like(reference_l5),
-            }
-        if mode == "uniform_same_budget":
-            local_ratio = ratio_l2 / ratio_l1 if ratio_l1 > 0 else 0.0
-            return {
-                "l4": torch.full_like(reference_l4, ratio_l1),
-                "l5_local": torch.full_like(reference_l5, local_ratio),
-            }
-        if mode == "oracle_error_selection":
-            target_l4 = self.model.aggregate_img_values_to_l4_faces(ground_truth)
-            selection_l4 = build_fixed_area_target(
-                (target_l4 - adaptive_outputs["saliency_l4"]).abs(),
-                self.model.hierarchy_l4_l5.coarse_face_areas,
-                ratio_l1,
-            )
-            # S5 depends on the L4 gate. Recompute it under the oracle parent
-            # selection before ranking L5 children; L5's own gate is downstream
-            # of S5 and can be temporarily set to one.
-            provisional = self.model(
-                rgb,
-                return_aux=True,
-                gate_overrides={
-                    "l4": selection_l4,
-                    "l5_local": torch.ones_like(reference_l5),
-                },
-            )
-            target_l5 = self.model.aggregate_img_values_to_l5_faces(ground_truth)
-            eligible_l5 = self.model.hierarchy_l4_l5.propagate_coarse_face_values(
-                selection_l4
-            ).bool()
-            selection_l5 = build_fixed_area_target(
-                (target_l5 - provisional["saliency_l5"]).abs(),
-                self.model.hierarchy_l5_l6.coarse_face_areas,
-                ratio_l2,
-                eligible_mask=eligible_l5,
-            )
-            return {
-                "l4": selection_l4,
-                "l5_local": selection_l5,
-            }
-        if mode == "random_same_budget":
-            generator = torch.Generator(device=reference_l4.device)
-            generator.manual_seed(self.args.diagnostic_random_seed + batch_index)
-            random_l4 = torch.rand(
-                reference_l4.shape,
-                device=reference_l4.device,
-                dtype=reference_l4.dtype,
-                generator=generator,
-            )
-            selection_l4 = build_fixed_area_target(
-                random_l4,
-                self.model.hierarchy_l4_l5.coarse_face_areas,
-                ratio_l1,
-            )
-            eligible_l5 = self.model.hierarchy_l4_l5.propagate_coarse_face_values(
-                selection_l4
-            ).bool()
-            random_l5 = torch.rand(
-                reference_l5.shape,
-                device=reference_l5.device,
-                dtype=reference_l5.dtype,
-                generator=generator,
-            )
-            selection_l5 = build_fixed_area_target(
-                random_l5,
-                self.model.hierarchy_l5_l6.coarse_face_areas,
-                ratio_l2,
-                eligible_mask=eligible_l5,
-            )
-            return {"l4": selection_l4, "l5_local": selection_l5}
-        raise ValueError(f"Unknown gate comparison mode: {mode}")
+        target_l4 = self.model.aggregate_img_values_to_l4_faces(ground_truth)
+        selection_l4 = build_fixed_area_target(
+            (target_l4 - learned_outputs["saliency_l4"]).abs(),
+            self.model.hierarchy_l4_l5.coarse_face_areas,
+            self.args.target_refine_ratio_l1,
+        )
+        provisional = self.model(
+            rgb,
+            return_aux=True,
+            hard_mask_overrides={"l4": selection_l4},
+        )
+        target_l5 = self.model.aggregate_img_values_to_l5_faces(ground_truth)
+        eligible_l5 = self.model.hierarchy_l4_l5.propagate_coarse_face_values(
+            selection_l4
+        ).bool()
+        selection_l5 = build_fixed_area_target(
+            (target_l5 - provisional["saliency_l5"]).abs(),
+            self.model.hierarchy_l5_l6.coarse_face_areas,
+            self.args.target_refine_ratio_l2,
+            eligible_mask=eligible_l5,
+        )
+        return {"l4": selection_l4, "l5": selection_l5}
 
-    def _write_adaptive_diagnostics(self, results, comparison_results):
-        report = self.adaptive_diagnostics.summary()
+    def _write_uahs_diagnostics(
+            self,
+            results,
+            comparison_results,
+            comparison_area_results,
+    ):
+        report = self.uahs_diagnostics.summary()
         report["configuration"] = {
             "checkpoint": self.args.base_model_weights,
             "dataset": self.args.dataset_name,
+            "model_type": self.args.model_type,
+            "seq_length": self.args.seq_length,
+            "temporal_window_radius": self.args.temporal_window_radius,
             "img_rank": self.model.img_rank,
             "fine_rank": self.model.fine_rank,
             "coarse_rank": self.model.coarse_rank,
-            "target_refine_ratio": self.args.target_refine_ratio,
+            "embed_dim": self.model.embed_dim,
+            "num_heads": self.args.enc_num_heads[0],
+            "local_motion_blocks": 2,
+            "global_content_blocks": 1,
+            "global_query_chunk_size": self.args.global_query_chunk_size,
             "target_refine_ratio_l1": self.args.target_refine_ratio_l1,
             "target_refine_ratio_l2": self.args.target_refine_ratio_l2,
             "max_batches": self.args.max_batches,
@@ -403,24 +316,22 @@ class InferenceRunner:
             report["configuration"]["middle_rank"] = self.model.middle_rank
         if comparison_results:
             higher_is_better = {"AUC", "NSS", "CC", "SIM"}
-            report["gate_comparisons"] = {
+            report["selector_comparisons"] = {
                 "definitions": {
-                    "full_fine": "all hierarchy gates are one",
-                    "uniform_same_budget": (
-                        "constant soft gates with effective areas equal to budgets"
-                    ),
+                    "uncertainty_only": "hard area selection ranked by uncertainty",
+                    "saliency_score": "hard area selection ranked by saliency",
                     "random_same_budget": (
-                        "random binary hierarchical selection at equal areas"
+                        "random hard hierarchy at the same fixed area budgets"
                     ),
-                    "oracle_error_selection": (
-                        "GT-error top-area hierarchical selection"
+                    "oracle_error_same_budget": (
+                        "GT-error hard hierarchy; diagnostic, not a theoretical upper bound"
                     ),
                 },
-                "adaptive_metrics": results,
+                "learned_refinement_score_metrics": results,
                 "baselines": {},
             }
             for mode, baseline_results in comparison_results.items():
-                adaptive_gain = {
+                learned_gain = {
                     name: (
                         results[name] - baseline_results[name]
                         if name in higher_is_better
@@ -429,24 +340,25 @@ class InferenceRunner:
                     for name in results
                     if name in baseline_results
                 }
-                report["gate_comparisons"]["baselines"][mode] = {
+                report["selector_comparisons"]["baselines"][mode] = {
                     "metrics": baseline_results,
-                    "adaptive_gain_positive_is_better": adaptive_gain,
+                    "actual_area_ratio": comparison_area_results.get(mode),
+                    "learned_gain_positive_is_better": learned_gain,
                 }
 
         output_path = self.args.diagnostics_output
         if not output_path:
             output_path = os.path.join(
                 os.path.dirname(self.args.output_dir),
-                "adaptive_diagnostics.json",
+                "uahs_diagnostics.json",
             )
         output_parent = os.path.dirname(os.path.abspath(output_path))
         os.makedirs(output_parent, exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as output_file:
             json.dump(report, output_file, indent=2, ensure_ascii=False)
-        print("\n========== Adaptive Diagnostics ==========")
+        print("\n========== UAHS Diagnostics ==========")
         print(json.dumps(report, indent=2, ensure_ascii=False))
-        print(f"Adaptive diagnostics written to: {output_path}")
+        print(f"UAHS diagnostics written to: {output_path}")
 
     @torch.no_grad()
     def run(self):
@@ -460,19 +372,23 @@ class InferenceRunner:
             mode: {name: 0 for name in metric_totals}
             for mode in self.comparison_modes
         }
+        comparison_area_totals = {
+            mode: {"level_l1": 0.0, "level_l2": 0.0, "frames": 0}
+            for mode in self.comparison_modes
+        }
         progress = tqdm.tqdm(
             self.loader_test, desc=f"{self.args.dataset_name} inference"
         )
         for batch_idx, batch in enumerate(progress):
             device_batch = self._to_device(batch)
             valid_lengths = batch["valid_length"].tolist()
-            if self.adaptive_diagnostics is not None:
-                adaptive_outputs = self.model(
+            if self.uahs_diagnostics is not None:
+                learned_outputs = self.model(
                     device_batch["normalized_sphere_rgb"], return_aux=True
                 )
-                predictions = adaptive_outputs["saliency"]
-                self.adaptive_diagnostics.update(
-                    adaptive_outputs,
+                predictions = learned_outputs["saliency"]
+                self.uahs_diagnostics.update(
+                    learned_outputs,
                     device_batch["normalized_sphere_sal"],
                     valid_lengths,
                     self.model,
@@ -490,29 +406,40 @@ class InferenceRunner:
             )
 
             for mode in self.comparison_modes:
-                if self.args.model_type == "adaptive_sphere_uformer_v2":
-                    gate_overrides = self._build_v2_gate_overrides(
-                        mode,
-                        adaptive_outputs,
+                if mode == "oracle_error_same_budget":
+                    mask_overrides = self._build_oracle_masks(
+                        learned_outputs,
                         device_batch["normalized_sphere_sal"],
-                        batch_idx,
                         device_batch["normalized_sphere_rgb"],
                     )
-                    comparison_predictions = self.model(
+                    comparison_outputs = self.model(
                         device_batch["normalized_sphere_rgb"],
-                        return_aux=False,
-                        gate_overrides=gate_overrides,
+                        return_aux=True,
+                        hard_mask_overrides=mask_overrides,
                     )
                 else:
-                    adaptive_enabled = self.model.use_adaptive_refinement
-                    try:
-                        self.model.use_adaptive_refinement = False
-                        comparison_predictions = self.model(
-                            device_batch["normalized_sphere_rgb"],
-                            return_aux=False,
-                        )
-                    finally:
-                        self.model.use_adaptive_refinement = adaptive_enabled
+                    comparison_outputs = self.model(
+                        device_batch["normalized_sphere_rgb"],
+                        return_aux=True,
+                        selector_mode=mode,
+                        selector_seed=self.args.diagnostic_random_seed + batch_idx,
+                    )
+                comparison_predictions = comparison_outputs["saliency"]
+                for sample_idx, valid_length in enumerate(valid_lengths):
+                    valid_length = int(valid_length)
+                    if valid_length == 0:
+                        continue
+                    comparison_area_totals[mode]["level_l1"] += (
+                        comparison_outputs["selected_area_l1"][
+                            sample_idx, :valid_length
+                        ].sum().item()
+                    )
+                    comparison_area_totals[mode]["level_l2"] += (
+                        comparison_outputs["selected_area_l2"][
+                            sample_idx, :valid_length
+                        ].sum().item()
+                    )
+                    comparison_area_totals[mode]["frames"] += valid_length
                 self._update_sphere_metrics(
                     comparison_predictions,
                     device_batch,
@@ -520,11 +447,12 @@ class InferenceRunner:
                     comparison_metric_totals[mode],
                     comparison_metric_frames[mode],
                 )
-            self._save_predictions(batch, predictions)
+            if not self.args.metrics_only:
+                self._save_predictions(batch, predictions)
             if self.args.max_batches and batch_idx + 1 >= self.args.max_batches:
                 break
 
-        if self.args.save_mat:
+        if self.args.save_mat and not self.args.metrics_only:
             self.save_mat_results()
 
         results = self._mean_metrics(metric_totals, metric_frames)
@@ -533,11 +461,22 @@ class InferenceRunner:
             " ".join(f"{name}={value:.6f}" for name, value in results.items()),
         )
         comparison_results = {}
+        comparison_area_results = {}
         for mode in self.comparison_modes:
             comparison_results[mode] = self._mean_metrics(
                 comparison_metric_totals[mode],
                 comparison_metric_frames[mode],
             )
+            area_totals = comparison_area_totals[mode]
+            if area_totals["frames"]:
+                comparison_area_results[mode] = {
+                    "level_l1": (
+                        area_totals["level_l1"] / area_totals["frames"]
+                    ),
+                    "level_l2": (
+                        area_totals["level_l2"] / area_totals["frames"]
+                    ),
+                }
             print(
                 f"{mode} metrics:",
                 " ".join(
@@ -545,8 +484,19 @@ class InferenceRunner:
                     for name, value in comparison_results[mode].items()
                 ),
             )
-        if self.adaptive_diagnostics is not None:
-            self._write_adaptive_diagnostics(results, comparison_results)
+            if mode in comparison_area_results:
+                area_results = comparison_area_results[mode]
+                print(
+                    f"{mode} actual area:",
+                    f"L1={area_results['level_l1']:.6f}",
+                    f"L2={area_results['level_l2']:.6f}",
+                )
+        if self.uahs_diagnostics is not None:
+            self._write_uahs_diagnostics(
+                results,
+                comparison_results,
+                comparison_area_results,
+            )
         return results
 
 
@@ -574,22 +524,26 @@ def main():
         help="also save per-video .mat results in a saliency_mat folder next to saliency_png",
     )
     parser.add_argument(
-        "--adaptive_diagnostics",
+        "--metrics_only",
         action="store_true",
-        help="collect UAHS gate, uncertainty, budget, and coarse-rank statistics",
+        help="compute metrics/diagnostics without writing predictions or ERP outputs",
     )
     parser.add_argument(
-        "--compare_uniform_gate",
+        "--uahs_diagnostics",
         action="store_true",
-        help="evaluate the same adaptive checkpoint in full_fine gate=1 mode",
+        help="collect UAHS uncertainty, selector, hierarchy, and efficiency statistics",
     )
     parser.add_argument(
-        "--compare_gate_baselines",
-        action="store_true",
-        help=(
-            "for UAHS-V2 evaluate full_fine, uniform/random same-budget, "
-            "and oracle-error gates"
+        "--selector_comparison_modes",
+        nargs="+",
+        choices=(
+            "uncertainty_only",
+            "saliency_score",
+            "random_same_budget",
+            "oracle_error_same_budget",
         ),
+        default=None,
+        help="evaluate selected hard-selector baselines at identical area budgets",
     )
     parser.add_argument(
         "--diagnostic_random_seed",
@@ -600,11 +554,11 @@ def main():
     parser.add_argument(
         "--diagnostics_output",
         default=None,
-        help="optional JSON path for adaptive diagnostics",
+        help="optional JSON path for UAHS diagnostics",
     )
     args = parser.parse_args()
-    if args.compare_uniform_gate or args.compare_gate_baselines:
-        args.adaptive_diagnostics = True
+    if args.selector_comparison_modes:
+        args.uahs_diagnostics = True
     args.task = "salient"
     args.test = True
                                           
@@ -623,19 +577,22 @@ def main():
     runner = InferenceRunner(args)
     sphere_metrics = runner.run()
 
-    print("\n========== ERP Metrics ==========")
-    if args.dataset_name == "AVS-ODV":
-        ground_truth_dir = args.dataset_root_dir
+    if args.metrics_only:
+        print("\nERP evaluation skipped in --metrics_only mode")
     else:
-        ground_truth_dir = os.path.join(args.dataset_root_dir, "testing")
-    try:
-        evaluate_saliency_maps_in_folder(
-            args.output_dir,
-            ground_truth_dir,
-            args.dataset_name,
-        )
-    except Exception as error:
-        print(f"ERP evaluation failed: {error}")
+        print("\n========== ERP Metrics ==========")
+        if args.dataset_name == "AVS-ODV":
+            ground_truth_dir = args.dataset_root_dir
+        else:
+            ground_truth_dir = os.path.join(args.dataset_root_dir, "testing")
+        try:
+            evaluate_saliency_maps_in_folder(
+                args.output_dir,
+                ground_truth_dir,
+                args.dataset_name,
+            )
+        except Exception as error:
+            print(f"ERP evaluation failed: {error}")
 
     print("\n========== Sphere Metrics (for comparison) ==========")
     for name in ("AUC", "NSS", "CC", "SIM", "KL"):
@@ -648,15 +605,16 @@ if __name__ == "__main__":
 
 """
 CUDA_VISIBLE_DEVICES=3 python /home/dyz/PythonProject/Test_Codes/Sampling_test/inference.py \
-    --model_type adaptive_sphere_uformer \
+    --model_type uahs \
     --dataset_name Sports-360 \
-    --base_model_weights /home/dyz/PythonProject/Test_Codes/Sampling_test/log/models/Epoch_32model.pth \
+    --base_model_weights /home/dyz/PythonProject/Test_Codes/Sampling_test/log/models/Epoch_14model.pth \
     --output_dir /home/dyz/PythonProject/DataSet_Output/Sports-360 \
-    --method_name SphereUformer-adp \
-    --adaptive_diagnostics \
-    --compare_uniform_gate \
-    --diagnostics_output /home/dyz/PythonProject/Test_Codes/Sampling_test/log/adaptive_diagnostics.json \
-    --seq_length 30 \
+    --method_name UAHS \
+    --uahs_diagnostics \
+    --selector_comparison_modes uncertainty_only saliency_score random_same_budget oracle_error_same_budget \
+    --diagnostics_output /home/dyz/PythonProject/Test_Codes/Sampling_test/log/uahs_diagnostics.json \
+    --seq_length 12 \
+    --temporal_window_radius 5 \
     --val_batch_size 1 \
     --num_workers 8
 """

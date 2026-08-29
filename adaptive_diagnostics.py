@@ -1,4 +1,4 @@
-"""Streaming evaluation diagnostics for the dense UAHS prototype."""
+"""Streaming evaluation diagnostics for final sparse UAHS."""
 
 import math
 
@@ -95,6 +95,51 @@ class RunningPairMoments:
         return max(-1.0, min(1.0, correlation))
 
 
+class UncertaintyCalibrationBins:
+    """Accumulate mean predicted scale and mean absolute error in fixed bins."""
+
+    def __init__(self, edges=(0.0, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5)):
+        self.edges = tuple(float(value) for value in edges)
+        self.counts = [0 for _ in range(len(self.edges))]
+        self.uncertainty_totals = [0.0 for _ in self.counts]
+        self.error_totals = [0.0 for _ in self.counts]
+
+    def update(self, uncertainty, error):
+        uncertainty = uncertainty.detach().reshape(-1).to(dtype=torch.float64)
+        error = error.detach().reshape(-1).to(dtype=torch.float64)
+        finite = torch.isfinite(uncertainty) & torch.isfinite(error)
+        uncertainty, error = uncertainty[finite], error[finite]
+        if uncertainty.numel() == 0:
+            return
+        boundaries = uncertainty.new_tensor(self.edges[1:])
+        bins = torch.bucketize(uncertainty, boundaries)
+        for index in range(len(self.counts)):
+            selected = bins == index
+            if not bool(selected.any()):
+                continue
+            self.counts[index] += int(selected.sum().item())
+            self.uncertainty_totals[index] += float(uncertainty[selected].sum())
+            self.error_totals[index] += float(error[selected].sum())
+
+    def summary(self):
+        output = []
+        for index, lower in enumerate(self.edges):
+            upper = self.edges[index + 1] if index + 1 < len(self.edges) else None
+            count = self.counts[index]
+            output.append({
+                "lower": lower,
+                "upper": upper,
+                "count": count,
+                "mean_uncertainty": (
+                    self.uncertainty_totals[index] / count if count else None
+                ),
+                "mean_absolute_error": (
+                    self.error_totals[index] / count if count else None
+                ),
+            })
+        return output
+
+
 def per_frame_kl(prediction, target, epsilon=2.2204e-16):
     """Return KLD(target || prediction) independently for every frame."""
     prediction = prediction.float()
@@ -108,139 +153,7 @@ def per_frame_kl(prediction, target, epsilon=2.2204e-16):
     ).sum(dim=-1)
 
 
-class AdaptiveDiagnosticsAccumulator:
-    """Aggregate valid-frame UAHS statistics and calibration evidence."""
-
-    def __init__(self, target_refine_ratio):
-        self.target_refine_ratio = float(target_refine_ratio)
-        self.uncertainty = RunningMoments()
-        self.coarse_absolute_error = RunningMoments()
-        self.refine_score = RunningMoments()
-        self.fine_face_gate = RunningMoments()
-        self.area_refine_ratio = RunningMoments()
-        self.coarse_upsampled_kl = RunningMoments()
-        self.final_saliency_kl = RunningMoments()
-        self.uncertainty_error = RunningPairMoments()
-        self.gate_below_005 = 0
-        self.gate_above_095 = 0
-        self.gate_count = 0
-        self.frame_count = 0
-
-    def update(self, outputs, ground_truth, valid_lengths, model):
-        required = {
-            "saliency",
-            "coarse_saliency",
-            "uncertainty",
-            "refine_score",
-            "fine_face_gate",
-            "area_refine_ratio",
-        }
-        missing = required.difference(outputs)
-        if missing:
-            raise KeyError(f"Adaptive outputs are missing: {sorted(missing)}")
-
-        coarse_target = model.aggregate_img_values_to_coarse_faces(ground_truth)
-        coarse_error = (coarse_target - outputs["coarse_saliency"]).abs()
-        coarse_upsampled = model.upsample_coarse_values_to_img(
-            outputs["coarse_saliency"]
-        )
-        batch_size, time_steps = ground_truth.shape[:2]
-        if len(valid_lengths) != batch_size:
-            raise ValueError("valid_lengths must have one entry per sample")
-
-        for sample_index, valid_length in enumerate(valid_lengths):
-            valid_length = int(valid_length)
-            if not 0 <= valid_length <= time_steps:
-                raise ValueError("A valid_length is outside the sequence range")
-            if valid_length == 0:
-                continue
-            time_slice = (sample_index, slice(0, valid_length))
-            uncertainty = outputs["uncertainty"][time_slice]
-            refine_score = outputs["refine_score"][time_slice]
-            fine_face_gate = outputs["fine_face_gate"][time_slice]
-            area_ratio = outputs["area_refine_ratio"][time_slice]
-            error = coarse_error[time_slice]
-
-            self.uncertainty.update(uncertainty)
-            self.coarse_absolute_error.update(error)
-            self.refine_score.update(refine_score)
-            self.fine_face_gate.update(fine_face_gate)
-            self.area_refine_ratio.update(area_ratio)
-            self.uncertainty_error.update(uncertainty, error)
-            finite_gate = fine_face_gate[torch.isfinite(fine_face_gate)]
-            self.gate_below_005 += int((finite_gate < 0.05).sum().item())
-            self.gate_above_095 += int((finite_gate > 0.95).sum().item())
-            self.gate_count += finite_gate.numel()
-
-            target = ground_truth[time_slice]
-            self.coarse_upsampled_kl.update(
-                per_frame_kl(coarse_upsampled[time_slice], target)
-            )
-            self.final_saliency_kl.update(
-                per_frame_kl(outputs["saliency"][time_slice], target)
-            )
-            self.frame_count += valid_length
-
-    def summary(self):
-        uncertainty_summary = self.uncertainty.summary()
-        error_summary = self.coarse_absolute_error.summary()
-        area_summary = self.area_refine_ratio.summary()
-        coarse_kl = self.coarse_upsampled_kl.summary()
-        final_kl = self.final_saliency_kl.summary()
-        area_mean = area_summary["mean"]
-        coarse_mean = coarse_kl["mean"]
-        final_mean = final_kl["mean"]
-        kl_reduction = (
-            None if coarse_mean is None or final_mean is None
-            else coarse_mean - final_mean
-        )
-        relative_kl_reduction = (
-            None if kl_reduction is None or coarse_mean == 0
-            else kl_reduction / coarse_mean
-        )
-        return {
-            "valid_frames": self.frame_count,
-            "uncertainty": {
-                **uncertainty_summary,
-                "coarse_absolute_error": error_summary,
-                "coarse_error_pearson": self.uncertainty_error.correlation(),
-                "mean_scale_to_error_ratio": (
-                    None
-                    if uncertainty_summary["mean"] is None
-                    or error_summary["mean"] in (None, 0)
-                    else uncertainty_summary["mean"] / error_summary["mean"]
-                ),
-            },
-            "refine_score": self.refine_score.summary(),
-            "fine_face_gate": {
-                **self.fine_face_gate.summary(),
-                "fraction_below_0.05": (
-                    self.gate_below_005 / self.gate_count
-                    if self.gate_count else None
-                ),
-                "fraction_above_0.95": (
-                    self.gate_above_095 / self.gate_count
-                    if self.gate_count else None
-                ),
-            },
-            "area_refine_ratio": {
-                **area_summary,
-                "target": self.target_refine_ratio,
-                "mean_minus_target": (
-                    None if area_mean is None
-                    else area_mean - self.target_refine_ratio
-                ),
-            },
-            "coarse_rank_evidence": {
-                "coarse_upsampled_kl": coarse_kl,
-                "final_saliency_kl": final_kl,
-                "absolute_kl_reduction": kl_reduction,
-                "relative_kl_reduction": relative_kl_reduction,
-            },
-        }
-
-
-def build_v2_selection_targets(
+def build_uahs_selection_targets(
         outputs,
         ground_truth,
         model,
@@ -291,6 +204,7 @@ class HierarchicalLevelDiagnostics:
         self.selection_iou = RunningMoments()
         self.selection_precision = RunningMoments()
         self.selection_recall = RunningMoments()
+        self.calibration = UncertaintyCalibrationBins()
 
     def update(
             self,
@@ -309,6 +223,7 @@ class HierarchicalLevelDiagnostics:
         self.gate.update(gate)
         self.area_ratio.update(area_ratio)
         self.uncertainty_error.update(uncertainty, error)
+        self.calibration.update(uncertainty, error)
         self.spearman.update(per_frame_spearman(uncertainty, error))
         selection = area_weighted_binary_metrics(
             predicted_selection, target_selection, face_areas
@@ -336,6 +251,7 @@ class HierarchicalLevelDiagnostics:
                     if uncertainty["mean"] is None or error["mean"] in (None, 0)
                     else uncertainty["mean"] / error["mean"]
                 ),
+                "calibration_bins": self.calibration.summary(),
             },
             "refine_score": self.refine_score.summary(),
             "gate": self.gate.summary(),
@@ -355,8 +271,8 @@ class HierarchicalLevelDiagnostics:
         }
 
 
-class AdaptiveDiagnosticsAccumulatorV2:
-    """Streaming diagnostics for recursive rank-(r-2)->(r-1)->r UAHS."""
+class UAHSDiagnosticsAccumulator:
+    """Streaming diagnostics for hard sparse rank-(r-2)->(r-1)->r UAHS."""
 
     def __init__(self, target_ratio_l1, target_ratio_l2):
         self.target_ratio_l1 = float(target_ratio_l1)
@@ -366,6 +282,18 @@ class AdaptiveDiagnosticsAccumulatorV2:
         self.saliency_l4_kl = RunningMoments()
         self.saliency_l5_kl = RunningMoments()
         self.final_saliency_kl = RunningMoments()
+        self.selected_vertex_ratio_l5 = RunningMoments()
+        self.selected_vertex_ratio_l6 = RunningMoments()
+        self.selected_queries_l5 = RunningMoments()
+        self.selected_queries_l6 = RunningMoments()
+        self.active_faces_l5 = RunningMoments()
+        self.active_faces_l6 = RunningMoments()
+        self.query_reduction_l5 = RunningMoments()
+        self.query_reduction_l6 = RunningMoments()
+        self.sparse_attention_flops_l5 = RunningMoments()
+        self.sparse_attention_flops_l6 = RunningMoments()
+        self.dense_attention_flops_l5 = RunningMoments()
+        self.dense_attention_flops_l6 = RunningMoments()
         self.frame_count = 0
 
     def update(self, outputs, ground_truth, valid_lengths, model):
@@ -374,38 +302,38 @@ class AdaptiveDiagnosticsAccumulatorV2:
             "saliency_l4",
             "uncertainty_l4",
             "refine_score_l4",
-            "gate_l4_parent",
-            "area_ratio_l1",
+            "hard_face_mask_l4",
+            "selected_area_l1",
             "saliency_l5",
             "uncertainty_l5",
             "refine_score_l5",
-            "gate_l5_to_l6_effective",
-            "area_ratio_l2",
+            "hard_face_mask_l5_effective",
+            "selected_area_l2",
+            "selected_vertex_ratio_l5",
+            "selected_vertex_ratio_l6",
+            "selected_spatial_queries_l5",
+            "selected_spatial_queries_l6",
+            "active_refinement_faces_l5",
+            "active_refinement_faces_l6",
+            "spatial_query_reduction_l5",
+            "spatial_query_reduction_l6",
+            "estimated_sparse_attention_flops_l5",
+            "estimated_sparse_attention_flops_l6",
+            "estimated_dense_attention_flops_l5",
+            "estimated_dense_attention_flops_l6",
         }
         missing = required.difference(outputs)
         if missing:
-            raise KeyError(f"UAHS-V2 outputs are missing: {sorted(missing)}")
-        targets = build_v2_selection_targets(
+            raise KeyError(f"UAHS outputs are missing: {sorted(missing)}")
+        targets = build_uahs_selection_targets(
             outputs,
             ground_truth,
             model,
             self.target_ratio_l1,
             self.target_ratio_l2,
         )
-        predicted_l4 = build_fixed_area_target(
-            outputs["refine_score_l4"],
-            model.hierarchy_l4_l5.coarse_face_areas,
-            self.target_ratio_l1,
-        )
-        predicted_parent_l5 = model.hierarchy_l4_l5.propagate_coarse_face_values(
-            predicted_l4
-        ).bool()
-        predicted_l5 = build_fixed_area_target(
-            outputs["refine_score_l5"],
-            model.hierarchy_l5_l6.coarse_face_areas,
-            self.target_ratio_l2,
-            eligible_mask=predicted_parent_l5,
-        )
+        predicted_l4 = outputs["hard_face_mask_l4"]
+        predicted_l5 = outputs["hard_face_mask_l5_effective"]
         saliency_l4_up = model.upsample_l4_values_to_img(outputs["saliency_l4"])
         saliency_l5_up = model.upsample_l5_values_to_img(outputs["saliency_l5"])
 
@@ -423,8 +351,8 @@ class AdaptiveDiagnosticsAccumulatorV2:
                 outputs["uncertainty_l4"][valid],
                 targets["error_l4"][valid],
                 outputs["refine_score_l4"][valid],
-                outputs["gate_l4_parent"][valid],
-                outputs["area_ratio_l1"][valid],
+                outputs["hard_face_mask_l4"][valid],
+                outputs["selected_area_l1"][valid],
                 predicted_l4[valid],
                 targets["selection_l4"][valid],
                 model.hierarchy_l4_l5.coarse_face_areas,
@@ -433,8 +361,8 @@ class AdaptiveDiagnosticsAccumulatorV2:
                 outputs["uncertainty_l5"][valid],
                 targets["error_l5"][valid],
                 outputs["refine_score_l5"][valid],
-                outputs["gate_l5_to_l6_effective"][valid],
-                outputs["area_ratio_l2"][valid],
+                outputs["hard_face_mask_l5_effective"][valid],
+                outputs["selected_area_l2"][valid],
                 predicted_l5[valid],
                 targets["selection_l5"][valid],
                 model.hierarchy_l5_l6.coarse_face_areas,
@@ -444,6 +372,42 @@ class AdaptiveDiagnosticsAccumulatorV2:
             self.saliency_l5_kl.update(per_frame_kl(saliency_l5_up[valid], target))
             self.final_saliency_kl.update(
                 per_frame_kl(outputs["saliency"][valid], target)
+            )
+            self.selected_vertex_ratio_l5.update(
+                outputs["selected_vertex_ratio_l5"][valid]
+            )
+            self.selected_vertex_ratio_l6.update(
+                outputs["selected_vertex_ratio_l6"][valid]
+            )
+            self.selected_queries_l5.update(
+                outputs["selected_spatial_queries_l5"][valid]
+            )
+            self.selected_queries_l6.update(
+                outputs["selected_spatial_queries_l6"][valid]
+            )
+            self.active_faces_l5.update(
+                outputs["active_refinement_faces_l5"][valid]
+            )
+            self.active_faces_l6.update(
+                outputs["active_refinement_faces_l6"][valid]
+            )
+            self.query_reduction_l5.update(
+                outputs["spatial_query_reduction_l5"][valid]
+            )
+            self.query_reduction_l6.update(
+                outputs["spatial_query_reduction_l6"][valid]
+            )
+            self.sparse_attention_flops_l5.update(
+                outputs["estimated_sparse_attention_flops_l5"][valid]
+            )
+            self.sparse_attention_flops_l6.update(
+                outputs["estimated_sparse_attention_flops_l6"][valid]
+            )
+            self.dense_attention_flops_l5.update(
+                outputs["estimated_dense_attention_flops_l5"][valid]
+            )
+            self.dense_attention_flops_l6.update(
+                outputs["estimated_dense_attention_flops_l6"][valid]
             )
             self.frame_count += valid_length
 
@@ -456,5 +420,27 @@ class AdaptiveDiagnosticsAccumulatorV2:
                 "saliency_l4_upsampled": self.saliency_l4_kl.summary(),
                 "saliency_l5_upsampled": self.saliency_l5_kl.summary(),
                 "final_saliency": self.final_saliency_kl.summary(),
+            },
+            "sparse_efficiency": {
+                "selected_vertex_ratio_l5": self.selected_vertex_ratio_l5.summary(),
+                "selected_vertex_ratio_l6": self.selected_vertex_ratio_l6.summary(),
+                "selected_queries_l5": self.selected_queries_l5.summary(),
+                "selected_queries_l6": self.selected_queries_l6.summary(),
+                "active_faces_l5": self.active_faces_l5.summary(),
+                "active_faces_l6": self.active_faces_l6.summary(),
+                "spatial_query_reduction_l5": self.query_reduction_l5.summary(),
+                "spatial_query_reduction_l6": self.query_reduction_l6.summary(),
+                "estimated_sparse_attention_flops_l5": (
+                    self.sparse_attention_flops_l5.summary()
+                ),
+                "estimated_sparse_attention_flops_l6": (
+                    self.sparse_attention_flops_l6.summary()
+                ),
+                "estimated_dense_attention_flops_l5": (
+                    self.dense_attention_flops_l5.summary()
+                ),
+                "estimated_dense_attention_flops_l6": (
+                    self.dense_attention_flops_l6.summary()
+                ),
             },
         }

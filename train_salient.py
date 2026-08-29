@@ -34,31 +34,21 @@ class Trainer:
             downsample=args.downsample,
             scale_depth=args.scale_depth,
             model_type=args.model_type,
-            coarse_rank_offset=args.coarse_rank_offset,
-            adaptive_coarse_depth=args.adaptive_coarse_depth,
-            adaptive_middle_depth=getattr(args, "adaptive_middle_depth", 1),
-            adaptive_fine_depth=args.adaptive_fine_depth,
-            adaptive_temperature=args.adaptive_temperature,
-            adaptive_region_type=getattr(args, "adaptive_region_type", "face"),
             coarse_pool_type=getattr(args, "coarse_pool_type", "mean_max"),
-            face_to_vertex_reduce=getattr(args, "face_to_vertex_reduce", "mean"),
-            target_refine_ratio=args.target_refine_ratio,
-            target_refine_ratio_l1=getattr(
-                args, "target_refine_ratio_l1", 0.25
-            ),
-            target_refine_ratio_l2=getattr(
-                args, "target_refine_ratio_l2", 0.125
-            ),
-            lambda_coarse=args.lambda_coarse,
-            lambda_uncertainty=getattr(args, "lambda_uncertainty", 0.1),
-            lambda_refine=args.lambda_refine,
-            lambda_budget=args.lambda_budget,
-            use_adaptive_refinement=args.use_adaptive_refinement,
+            target_refine_ratio_l1=args.target_refine_ratio_l1,
+            target_refine_ratio_l2=args.target_refine_ratio_l2,
+            global_query_chunk_size=args.global_query_chunk_size,
+            hard_selection_warmup_epochs=args.hard_selection_warmup_epochs,
+            lambda_saliency_l4=args.lambda_saliency_l4,
+            lambda_saliency_l5=args.lambda_saliency_l5,
+            lambda_uncertainty_l4=args.lambda_uncertainty_l4,
+            lambda_uncertainty_l5=args.lambda_uncertainty_l5,
+            lambda_refine_l4=args.lambda_refine_l4,
+            lambda_refine_l5=args.lambda_refine_l5,
             use_uncertainty_refinement=getattr(
                 args, "use_uncertainty_refinement", True
             ),
             use_motion_refinement=args.use_motion_refinement,
-            use_budget_regularization=args.use_budget_regularization,
         )
 
                     
@@ -132,24 +122,30 @@ class Trainer:
             raise ValueError("--warmup_epochs must be non-negative")
         if not 0 <= args.min_learning_rate <= args.learning_rate:
             raise ValueError("--min_learning_rate must be between 0 and --learning_rate")
-        if args.temporal_window_radius < 0:
-            raise ValueError("--temporal_window_radius must be non-negative")
-        if not 0 <= args.target_refine_ratio <= 1:
-            raise ValueError("--target_refine_ratio must be between 0 and 1")
-        target_ratio_l1 = getattr(args, "target_refine_ratio_l1", 0.25)
-        target_ratio_l2 = getattr(args, "target_refine_ratio_l2", 0.125)
+        if (
+                args.temporal_window_radius is not None
+                and args.temporal_window_radius < 0
+        ):
+            raise ValueError(
+                "--temporal_window_radius must be non-negative or None"
+            )
+        target_ratio_l1 = args.target_refine_ratio_l1
+        target_ratio_l2 = args.target_refine_ratio_l2
         if not 0 <= target_ratio_l2 <= target_ratio_l1 <= 1:
             raise ValueError(
                 "Expected 0 <= target_refine_ratio_l2 <= "
                 "target_refine_ratio_l1 <= 1"
             )
-        if min(
-                args.lambda_coarse,
-                getattr(args, "lambda_uncertainty", 0.1),
-                args.lambda_refine,
-                args.lambda_budget,
-        ) < 0:
-            raise ValueError("Adaptive loss weights must be non-negative")
+        loss_weights = (
+            args.lambda_saliency_l4,
+            args.lambda_saliency_l5,
+            args.lambda_uncertainty_l4,
+            args.lambda_uncertainty_l5,
+            args.lambda_refine_l4,
+            args.lambda_refine_l5,
+        )
+        if min(loss_weights) < 0:
+            raise ValueError("UAHS loss weights must be non-negative")
 
         param_groups = self.get_optimizer_param_groups(args.weight_decay)
         if args.optimizer == "adam":
@@ -502,16 +498,6 @@ class Trainer:
         return kl_sphere_torch(pre_sal,gt_sal)
 
     @staticmethod
-    def normalize_relative_refinement_target(difficulty):
-        """Build relative per-frame difficulty ranks for fixed-budget allocation.
-
-        This target is deliberately relative and is not predictive uncertainty.
-        """
-        minimum = difficulty.amin(dim=-1, keepdim=True)
-        maximum = difficulty.amax(dim=-1, keepdim=True)
-        return (difficulty - minimum) / (maximum - minimum + 1e-8)
-
-    @staticmethod
     def area_weighted_mean(values, face_areas):
         weights = face_areas.to(
             device=values.device, dtype=values.dtype
@@ -535,13 +521,13 @@ class Trainer:
         )
         return per_sample.mean()
 
-    def compute_v2_losses(self, ground_truth, adaptive_outputs):
-        """Compute recursive fixed-budget losses without leaking GT to forward."""
+    def compute_uahs_losses(self, ground_truth, outputs):
+        """Compute hard-hierarchy auxiliary losses; labels never enter forward."""
         B, T = ground_truth.shape[:2]
         target_l4 = self.model.aggregate_img_values_to_l4_faces(ground_truth)
         target_l5 = self.model.aggregate_img_values_to_l5_faces(ground_truth)
-        saliency_l4 = adaptive_outputs["saliency_l4"]
-        saliency_l5 = adaptive_outputs["saliency_l5"]
+        saliency_l4 = outputs["saliency_l4"]
+        saliency_l5 = outputs["saliency_l5"]
         loss_saliency_l4 = self.loss_kl_cc(
             saliency_l4.reshape(B * T, -1),
             target_l4.reshape(B * T, -1),
@@ -553,8 +539,8 @@ class Trainer:
             gt_fix=None,
         ) / (B * T)
 
-        uncertainty_l4 = adaptive_outputs["uncertainty_l4"]
-        uncertainty_l5 = adaptive_outputs["uncertainty_l5"]
+        uncertainty_l4 = outputs["uncertainty_l4"]
+        uncertainty_l5 = outputs["uncertainty_l5"]
         laplace_l4 = (
             (target_l4 - saliency_l4).abs() / uncertainty_l4
             + torch.log(uncertainty_l4)
@@ -571,12 +557,8 @@ class Trainer:
         )
 
         difficulty_l4 = (target_l4 - saliency_l4.detach()).abs()
-        target_ratio_l1 = getattr(
-            self.args, "target_refine_ratio_l1", 0.25
-        )
-        target_ratio_l2 = getattr(
-            self.args, "target_refine_ratio_l2", 0.125
-        )
+        target_ratio_l1 = self.args.target_refine_ratio_l1
+        target_ratio_l2 = self.args.target_refine_ratio_l2
         selection_target_l4 = build_fixed_area_target(
             difficulty_l4,
             self.model.hierarchy_l4_l5.coarse_face_areas,
@@ -594,12 +576,12 @@ class Trainer:
         )
 
         refine_bce_l4 = F.binary_cross_entropy_with_logits(
-            adaptive_outputs["refine_logits_l4"],
+            outputs["refine_logits_l4"],
             selection_target_l4,
             reduction="none",
         )
         refine_bce_l5 = F.binary_cross_entropy_with_logits(
-            adaptive_outputs["refine_logits_l5"],
+            outputs["refine_logits_l5"],
             selection_target_l5,
             reduction="none",
         )
@@ -611,12 +593,6 @@ class Trainer:
             self.model.hierarchy_l5_l6.coarse_face_areas,
             eligible_l5,
         )
-        loss_budget_l1 = (
-            adaptive_outputs["area_ratio_l1"] - target_ratio_l1
-        ).square().mean()
-        loss_budget_l2 = (
-            adaptive_outputs["area_ratio_l2"] - target_ratio_l2
-        ).square().mean()
         return {
             "loss_saliency_l4": loss_saliency_l4,
             "loss_saliency_l5": loss_saliency_l5,
@@ -624,8 +600,6 @@ class Trainer:
             "loss_uncertainty_l5": loss_uncertainty_l5,
             "loss_refine_l4": loss_refine_l4,
             "loss_refine_l5": loss_refine_l5,
-            "loss_budget_l1": loss_budget_l1,
-            "loss_budget_l2": loss_budget_l2,
             "selection_target_l4": selection_target_l4,
             "selection_target_l5": selection_target_l5,
         }
@@ -633,6 +607,8 @@ class Trainer:
     def train_one_epoch(self):
         """训练单个epoch"""
         self.model.train()
+        if hasattr(self.model, "set_epoch"):
+            self.model.set_epoch(self.epoch)
         batches = islice(self.loader_train, self.train_batches_per_epoch)
         pbar = tqdm.tqdm(batches, total=self.train_batches_per_epoch)
         pbar.set_description(f"## {self.args.exp_name} ## Training Epoch_{self.epoch}")
@@ -710,6 +686,8 @@ class Trainer:
     def validate(self):
         """验证模型性能"""
         self.model.eval()
+        if hasattr(self.model, "set_epoch"):
+            self.model.set_epoch(self.epoch)
         pbar = tqdm.tqdm(self.loader_val)
         pbar.set_description(f"Validating Epoch_{self.epoch}")
         loss_sum = []
@@ -764,14 +742,12 @@ class Trainer:
         gt_sal = inputs["normalized_sphere_sal"]
         gt_fix = inputs["normalized_sphere_fix"]
 
-        adaptive_v1 = self.args.model_type == "adaptive_sphere_uformer"
-        adaptive_v2 = self.args.model_type == "adaptive_sphere_uformer_v2"
-        adaptive = adaptive_v1 or adaptive_v2
-        if adaptive:
-            adaptive_outputs = self.model(x, return_aux=True)
-            pred_sal = adaptive_outputs["saliency"]
+        is_uahs = self.args.model_type == "uahs"
+        if is_uahs:
+            uahs_outputs = self.model(x, return_aux=True)
+            pred_sal = uahs_outputs["saliency"]
         else:
-            adaptive_outputs = None
+            uahs_outputs = None
             pred_sal = self.model(x)
 
               
@@ -783,91 +759,34 @@ class Trainer:
                   
         loss_rec = self.loss_kl_cc(pre_probs, gt_probs,gt_fix)/(B*T)
 
-        loss_coarse = loss_rec.new_zeros(())
-        loss_uncertainty = loss_rec.new_zeros(())
-        loss_refine = loss_rec.new_zeros(())
-        loss_budget = loss_rec.new_zeros(())
-        v2_losses = {}
-        if adaptive_v2:
-            v2_losses = self.compute_v2_losses(gt_sal, adaptive_outputs)
-            loss_coarse = 0.5 * (
-                v2_losses["loss_saliency_l4"]
-                + v2_losses["loss_saliency_l5"]
+        auxiliary_losses = {}
+        total_loss = loss_rec
+        if uahs_outputs is not None:
+            auxiliary_losses = self.compute_uahs_losses(gt_sal, uahs_outputs)
+            total_loss = (
+                loss_rec
+                + self.args.lambda_saliency_l4
+                * auxiliary_losses["loss_saliency_l4"]
+                + self.args.lambda_saliency_l5
+                * auxiliary_losses["loss_saliency_l5"]
+                + self.args.lambda_uncertainty_l4
+                * auxiliary_losses["loss_uncertainty_l4"]
+                + self.args.lambda_uncertainty_l5
+                * auxiliary_losses["loss_uncertainty_l5"]
+                + self.args.lambda_refine_l4
+                * auxiliary_losses["loss_refine_l4"]
+                + self.args.lambda_refine_l5
+                * auxiliary_losses["loss_refine_l5"]
             )
-            loss_uncertainty = 0.5 * (
-                v2_losses["loss_uncertainty_l4"]
-                + v2_losses["loss_uncertainty_l5"]
-            )
-            if self.args.use_adaptive_refinement:
-                loss_refine = 0.5 * (
-                    v2_losses["loss_refine_l4"]
-                    + v2_losses["loss_refine_l5"]
-                )
-                if self.args.use_budget_regularization:
-                    loss_budget = 0.5 * (
-                        v2_losses["loss_budget_l1"]
-                        + v2_losses["loss_budget_l2"]
-                    )
-        elif adaptive_outputs is not None:
-            coarse_target = self.model.aggregate_img_values_to_coarse_faces(
-                gt_sal
-            )
-            coarse_saliency = adaptive_outputs["coarse_saliency"]
-            coarse_face_count = coarse_saliency.shape[-1]
-            coarse_probs = coarse_saliency.reshape(B * T, coarse_face_count)
-            coarse_target_probs = coarse_target.reshape(B * T, coarse_face_count)
-            loss_coarse = self.loss_kl_cc(
-                coarse_probs, coarse_target_probs, gt_fix=None
-            ) / (B * T)
-
-            uncertainty_scale = adaptive_outputs["uncertainty"]
-            laplace_nll = (
-                (coarse_target - coarse_saliency).abs() / uncertainty_scale
-                + torch.log(uncertainty_scale)
-            )
-            coarse_areas = self.model.coarse_fine_hierarchy.coarse_face_areas
-            coarse_area_weights = coarse_areas / coarse_areas.sum()
-            loss_uncertainty = (
-                laplace_nll * coarse_area_weights.reshape(1, 1, -1)
-            ).sum(dim=-1).mean()
-
-            if self.args.use_adaptive_refinement:
-                difficulty_target = (
-                    coarse_target - coarse_saliency.detach()
-                ).abs()
-                relative_refinement_target = (
-                    self.normalize_relative_refinement_target(difficulty_target)
-                )
-                loss_refine = F.smooth_l1_loss(
-                    adaptive_outputs["refine_score"],
-                    relative_refinement_target,
-                )
-                if self.args.use_budget_regularization:
-                    loss_budget = (
-                        adaptive_outputs["area_refine_ratio"]
-                        - self.args.target_refine_ratio
-                    ).square().mean()
-
-        total_loss = (
-            loss_rec
-            + self.args.lambda_coarse * loss_coarse
-            + getattr(self.args, "lambda_uncertainty", 0.1) * loss_uncertainty
-            + self.args.lambda_refine * loss_refine
-            + self.args.lambda_budget * loss_budget
-        )
 
         outputs = {"pred_sal": pred_sal.detach()}
         losses = {
             "loss": total_loss,
             "loss_saliency": loss_rec,
-            "loss_coarse": loss_coarse,
-            "loss_uncertainty": loss_uncertainty,
-            "loss_refine": loss_refine,
-            "loss_budget": loss_budget,
         }
         losses.update({
             name: value
-            for name, value in v2_losses.items()
+            for name, value in auxiliary_losses.items()
             if name.startswith("loss_")
         })
         return outputs, losses

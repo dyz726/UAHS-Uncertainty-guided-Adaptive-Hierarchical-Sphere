@@ -5,6 +5,24 @@ import os
 import argparse
 
 
+def optional_nonnegative_int(value):
+    """Parse a non-negative integer or ``none`` for an unmasked window."""
+    normalized = str(value).strip().lower()
+    if normalized in {"none", "full", "all"}:
+        return None
+    try:
+        parsed = int(normalized)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "expected a non-negative integer or 'none'"
+        ) from error
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(
+            "expected a non-negative integer or 'none'"
+        )
+    return parsed
+
+
 parser = argparse.ArgumentParser(description="360 Degree Saliency Prediction Training")
 
                  
@@ -29,7 +47,7 @@ parser.add_argument(
     help="AVS-ODV 数据集划分方式编号，使用 train_list_N.txt / test_list_N.txt；"
          "仅在 --dataset_name 为 AVS-ODV 时生效",
 )
-parser.add_argument("--seq_length", type=int, default="30")         
+parser.add_argument("--seq_length", type=int, default=12)
 
 
                 
@@ -52,26 +70,19 @@ parser.add_argument("--scale_depth", type=int, default=2)
 parser.add_argument("--debug_skip_attn", type=int, default=False)
 parser.add_argument("--append_self", type=int, default=False)
 parser.add_argument("--use_checkpoint", type=int, default=True)
-parser.add_argument("--temporal_window_radius", type=int, default=5)                               
+parser.add_argument(
+    "--temporal_window_radius",
+    type=optional_nonnegative_int,
+    default=5,
+    help="temporal half-window radius; use 'none' for full temporal attention",
+)
 
-# Adaptive multi-resolution prototype. The baseline remains the default.
+# Final UAHS and the published SphereUFormer baseline.
 parser.add_argument(
     "--model_type",
     type=str,
-    default="sphere_uformer",
-    choices=[
-        "sphere_uformer",
-        "adaptive_sphere_uformer",
-        "adaptive_sphere_uformer_v2",
-    ],
-)
-parser.add_argument("--coarse_rank_offset", type=int, default=2)
-parser.add_argument("--adaptive_coarse_depth", type=int, default=2)
-parser.add_argument("--adaptive_middle_depth", type=int, default=1)
-parser.add_argument("--adaptive_fine_depth", type=int, default=1)
-parser.add_argument("--adaptive_temperature", type=float, default=1.0)
-parser.add_argument(
-    "--adaptive_region_type", type=str, default="face", choices=["face"]
+    default="uahs",
+    choices=["sphere_uformer", "uahs"],
 )
 parser.add_argument(
     "--coarse_pool_type",
@@ -79,22 +90,16 @@ parser.add_argument(
     default="mean_max",
     choices=["center", "mean", "mean_max"],
 )
-parser.add_argument(
-    "--face_to_vertex_reduce", type=str, default="mean", choices=["mean"]
-)
-parser.add_argument("--target_refine_ratio", type=float, default=0.25)
 parser.add_argument("--target_refine_ratio_l1", type=float, default=0.25)
 parser.add_argument("--target_refine_ratio_l2", type=float, default=0.125)
-parser.add_argument("--lambda_coarse", type=float, default=0.3)
-parser.add_argument("--lambda_uncertainty", type=float, default=0.1)
-parser.add_argument("--lambda_refine", type=float, default=0.2)
-parser.add_argument("--lambda_budget", type=float, default=0.05)
-parser.add_argument(
-    "--disable_adaptive_refinement",
-    dest="use_adaptive_refinement",
-    action="store_false",
-    help="use a uniform gate of one for the coarse/fine architecture ablation",
-)
+parser.add_argument("--lambda_saliency_l4", type=float, default=0.15)
+parser.add_argument("--lambda_saliency_l5", type=float, default=0.15)
+parser.add_argument("--lambda_uncertainty_l4", type=float, default=0.05)
+parser.add_argument("--lambda_uncertainty_l5", type=float, default=0.05)
+parser.add_argument("--lambda_refine_l4", type=float, default=0.1)
+parser.add_argument("--lambda_refine_l5", type=float, default=0.1)
+parser.add_argument("--global_query_chunk_size", type=int, default=128)
+parser.add_argument("--hard_selection_warmup_epochs", type=int, default=0)
 parser.add_argument(
     "--disable_uncertainty_refinement",
     dest="use_uncertainty_refinement",
@@ -106,13 +111,8 @@ parser.add_argument(
     dest="use_motion_refinement",
     action="store_false",
 )
-parser.add_argument(
-    "--disable_budget_regularization",
-    dest="use_budget_regularization",
-    action="store_false",
-)
 parser.add_argument("--return_aux", action="store_true")
-parser.add_argument("--debug_adaptive", action="store_true")
+parser.add_argument("--debug_uahs", action="store_true")
 
         
 parser.add_argument("--dr", type=float, default=0.)
@@ -208,53 +208,38 @@ if __name__ == "__main__":
     main()
 
 """
-# Sports-360（默认，可省略 --dataset_root_dir，会自动解析为 /home/dyz/PythonProject/Dataset/Sports-360）
-CUDA_VISIBLE_DEVICES=4 python /home/dyz/PythonProject/Test_Codes/Sampling_test/train.py \
-    --dataset_name Sports-360 \
-    --mode vertex \
-    --img_rank 6 \
-    --seq_length 30 \
-    --num_epochs 60 \
-    --rel_pos_init_variance 0 \
-    --accum_grads 1 \
-    --train_batch_size 1 \
-    --val_batch_size 1 \
-    --optimizer adam \
-    --lr_scheduler reduce_on_plateau \
-    --learning_rate 1e-4 \
-    --min_learning_rate 1e-6 \
-    --weight_decay 1e-5 \
-    --log_dir /home/dyz/PythonProject/Test_Codes/Sampling_test/log \
-    --tensorboard_log_dir /home/dyz/PythonProject/log/tensorboard/sample-test
-
-
-     CUDA_VISIBLE_DEVICES=0 python /home/dyz/PythonProject/Test_Codes/Sampling_test/train.py \
-    --model_type adaptive_sphere_uformer \
+ CUDA_VISIBLE_DEVICES=4 \
+  python /home/dyz/PythonProject/Test_Codes/Sampling_test/train.py \
+    --model_type uahs \
     --dataset_name Sports-360 \
     --dataset_root_dir /home/dyz/PythonProject/Dataset/Sports-360 \
     --mode vertex \
     --img_rank 6 \
-    --seq_length 30 \
+    --seq_length 16 \
+    --temporal_window_radius 5 \
+    --coarse_pool_type mean_max \
+    --target_refine_ratio_l1 0.25 \
+    --target_refine_ratio_l2 0.125 \
+    --global_query_chunk_size 128 \
+    --hard_selection_warmup_epochs 0 \
+    --lambda_saliency_l4 0.15 \
+    --lambda_saliency_l5 0.15 \
+    --lambda_uncertainty_l4 0.05 \
+    --lambda_uncertainty_l5 0.05 \
+    --lambda_refine_l4 0.1 \
+    --lambda_refine_l5 0.1 \
     --train_batch_size 1 \
     --val_batch_size 1 \
-    --num_workers 4 \
-    --num_epochs 60 \
+    --num_workers 8 \
+    --num_epochs 100 \
     --optimizer adam \
     --learning_rate 1e-4 \
+    --min_learning_rate 1e-6 \
     --lr_scheduler reduce_on_plateau \
-    --rel_pos_init_variance 0 \
-    --coarse_rank_offset 2 \
-     --adaptive_coarse_depth 2 \
-    --adaptive_fine_depth 1 \
-    --adaptive_temperature 1.0 \
-    --adaptive_region_type face \
-    --coarse_pool_type mean_max \
-    --face_to_vertex_reduce mean \
-    --target_refine_ratio 0.25 \
-    --lambda_coarse 0.3 \
-    --lambda_uncertainty 0.1 \
-    --lambda_refine 0.2 \
-    --lambda_budget 0.05 \
-    --log_dir /home/dyz/PythonProject/Test_Codes/Sampling_test/log \
-    --tensorboard_log_dir /home/dyz/PythonProject/log/tensorboard/sample-test
+    --weight_decay 1e-4 \
+    --use_checkpoint 1 \
+    --accum_grads 1 \
+    --exp_name uahs-v3-sports360 \
+    --log_dir /home/dyz/PythonProject/Test_Codes/Sampling_test/log/uahs-v3-sports360 \
+    --tensorboard_log_dir /home/dyz/PythonProject/log/tensorboard/uahs
 """

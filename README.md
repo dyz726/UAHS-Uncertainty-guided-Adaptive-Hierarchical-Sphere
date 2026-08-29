@@ -1,98 +1,71 @@
-# Adaptive Multi-Resolution Prototype
+# UAHS — Uncertainty-guided Adaptive Hierarchical Sphere
 
-The repository supports both the original `SphereUFormer` baseline and an
-`AdaptiveSphereUFormer` research prototype. Select the prototype with
-`--model_type adaptive_sphere_uformer`; the default remains the baseline.
+This repository contains the published `SphereUFormer` baseline and the final
+UAHS model for 360° video saliency prediction. UAHS maps rank-6 RGB video to a
+rank-6 spherical saliency map `[B, T, 40962]` through six components:
 
-The audited adaptive model keeps SphereUFormer's vertex feature backbone but
-defines adaptive regions on exact triangular-face hierarchies. Fine vertex
-features are mean/max pooled through face descendants for the coarse encoder.
-Coarse vertex features are aggregated to faces, where separate saliency,
-heteroscedastic Laplace uncertainty, and refinement heads operate. The
-refinement head uses content, predicted uncertainty, and optional temporal
-motion. Coarse face gates propagate through exact 1-to-4 descendants and are
-averaged over incident faces to gate fine vertex residuals.
+1. local motion-aware spherical modeling at rank 4 (two blocks);
+2. true full-sphere, content-aware reasoning at rank 4 (one block);
+3. learned Laplace uncertainty at ranks 4 and 5;
+4. hard spherical-area selection at 25% and 12.5%;
+5. selected-query sparse refinement at ranks 5 and 6; and
+6. rank-4/rank-5/rank-6 multi-exit reconstruction.
 
-The current fine branch still evaluates every fine icosphere vertex. This is a
-differentiable dense prototype and **does not implement sparse FLOP reduction**.
-Future sparse selection can replace `AdaptiveRegionSelector` without changing
-the face-region interface.
+The rank-5 and rank-6 refiners gather only selected query vertices and their
+fixed spherical neighbors. They do not run dense high-resolution spatial
+attention. Upsampling supplies context only; fine detail is pooled/projected
+from the original rank-6 observation.
 
-## UAHS-V2 Recursive Hierarchy
+## Training
 
-Select V2 with `--model_type adaptive_sphere_uformer_v2`. For the default
-`img_rank=6`, V2 uses adjacent ranks 4→5→6. Rank-5 and rank-6 candidates each
-consume RGB features sampled directly from the original rank-6 input; lower
-rank upsampling supplies context only. Rank-5-to-6 effective gates are the
-product of the exact parent gate and the local child gate. All three encoders
-remain dense, so V2 also makes no sparse-computation or FLOP-reduction claim.
+The final model is selected with `--model_type uahs` (the default):
 
 ```bash
-python train.py --model_type adaptive_sphere_uformer_v2 \
-  --img_rank 6 --adaptive_coarse_depth 2 \
-  --adaptive_middle_depth 1 --adaptive_fine_depth 1 \
-  --coarse_pool_type mean_max \
-  --target_refine_ratio_l1 0.25 \
-  --target_refine_ratio_l2 0.125 \
-  --lambda_coarse 0.3 --lambda_uncertainty 0.1 \
-  --lambda_refine 0.2 --lambda_budget 0.05
+CUDA_VISIBLE_DEVICES=0 python train.py \
+  --model_type uahs --dataset_name Sports-360 \
+  --dataset_root_dir /path/to/Sports-360 \
+  --img_rank 6 --seq_length 12 --temporal_window_radius 5 \
+  --train_batch_size 1 --val_batch_size 1 \
+  --target_refine_ratio_l1 0.25 --target_refine_ratio_l2 0.125
 ```
 
-V2 refinement targets are binary, spherical-area-aware selections supervised
-with BCE logits. L1 selects the most difficult 25% of rank-4 faces. L2 selects
-12.5% of global area only from children of the selected L1 parents.
+Use `--model_type sphere_uformer` for the unchanged baseline. Run
+`python train.py --help` for loss weights and optimization options.
 
-Example training selection (add the normal dataset and optimization options):
+The UAHS objective is final saliency loss plus rank-4/rank-5 saliency,
+heteroscedastic Laplace uncertainty, and fixed-area selector BCE losses. Hard
+selection is used during training and inference; labels only construct loss
+targets and never enter `forward()`.
+
+## Verification
+
+Run geometry, hard-budget, sparse-equivalence, no-label-leak, gradient, and
+baseline regression tests:
 
 ```bash
-python train.py --model_type adaptive_sphere_uformer \
-  --coarse_rank_offset 2 --adaptive_coarse_depth 2 \
-  --adaptive_fine_depth 1 --adaptive_region_type face \
-  --coarse_pool_type mean_max --lambda_uncertainty 0.1 \
-  --target_refine_ratio 0.25
+/home/dyz/anaconda3/envs/sphereformer/bin/python smoke_test_uahs.py
 ```
 
-Use `--disable_adaptive_refinement` for the uniform fine-refinement ablation,
-`--disable_uncertainty_refinement` to remove uncertainty from the refinement
-decision, `--disable_motion_refinement` to remove motion, and
-`--disable_budget_regularization` to remove the gate-budget loss.
-
-`uncertainty` is an inference-time network prediction trained with a Laplace
-negative log-likelihood. The detached coarse saliency error is used separately
-as a relative fixed-budget refinement target; it is not called uncertainty.
-
-Run the low-rank CPU check in the project environment with:
+Run the real V100 FP32 preflight (`B=1`, `T=12`, rank 4→5→6, three optimizer
+steps) and write its memory/timing report:
 
 ```bash
-/home/dyz/anaconda3/envs/sphereformer/bin/python smoke_test_adaptive.py
+CUDA_VISIBLE_DEVICES=0 /home/dyz/anaconda3/envs/sphereformer/bin/python \
+  preflight_uahs.py --output log/uahs_v3_preflight.json
 ```
 
-Run the geometry audit with:
+## Evaluation and Diagnostics
 
 ```bash
-/home/dyz/anaconda3/envs/sphereformer/bin/python diagnose_sphere_hierarchy.py
+python inference.py --model_type uahs \
+  --base_model_weights /path/to/uahs.pth \
+  --dataset_root_dir /path/to/Sports-360 --metrics_only \
+  --uahs_diagnostics \
+  --selector_comparison_modes uncertainty_only saliency_score \
+    random_same_budget oracle_error_same_budget
 ```
 
-Evaluate a trained adaptive checkpoint with streaming UAHS diagnostics:
-
-```bash
-/home/dyz/anaconda3/envs/sphereformer/bin/python inference.py \
-  --model_type adaptive_sphere_uformer \
-  --base_model_weights /path/to/model.pth \
-  --dataset_name Sports-360 --dataset_root_dir /path/to/Sports-360 \
-  --adaptive_diagnostics --compare_uniform_gate \
-  --diagnostics_output /tmp/adaptive_diagnostics.json
-```
-
-The JSON report contains mean/std/min/max for predicted uncertainty,
-refinement score, fine-face gate, and area-weighted refinement ratio. It also
-reports gate saturation fractions, uncertainty/error scale ratio and correlation,
-coarse-upsampled versus final KLD, and an optional gate=1 evaluation of the
-same checkpoint. A positive `adaptive_gain_positive_is_better` means the
-adaptive prediction outperformed its uniform-gate counterpart. Diagnostics
-only consume existing auxiliary outputs and do not alter the model or loss.
-
-For V2, use `--compare_gate_baselines` to evaluate `full_fine`,
-`uniform_same_budget`, `random_same_budget`, and `oracle_error_selection`.
-Level-4 and level-5 reports include uncertainty Pearson/Spearman correlations,
-scale/error ratio, selection IoU/precision/recall, and actual refined area.
+Diagnostics include uncertainty calibration/correlation, selector
+IoU/precision/recall, hierarchical KL, exact selected spherical area, active
+vertices/queries, and estimated refinement work. Oracle error selection is a
+diagnostic reference only and is never used in normal inference.
