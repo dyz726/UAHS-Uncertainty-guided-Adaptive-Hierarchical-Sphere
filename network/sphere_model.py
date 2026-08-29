@@ -814,9 +814,18 @@ class RefinementHead(nn.Module):
             self,
             face_features: Tensor,
             uncertainty_scale: Tensor,
+            motion_magnitude: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         """Return logits and scores for [B, T, Fcoarse, C] features."""
-        if self.use_motion and face_features.shape[1] > 1:
+        if not self.use_motion:
+            motion = torch.zeros_like(face_features[..., :1])
+        elif motion_magnitude is not None:
+            if motion_magnitude.shape != face_features.shape[:-1]:
+                raise ValueError(
+                    "motion_magnitude must match [B, T, Fcoarse]"
+                )
+            motion = motion_magnitude.unsqueeze(-1)
+        elif face_features.shape[1] > 1:
             delta = (face_features[:, 1:] - face_features[:, :-1]).abs().mean(
                 dim=-1, keepdim=True
             )

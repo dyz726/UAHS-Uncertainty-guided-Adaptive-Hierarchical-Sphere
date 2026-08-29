@@ -307,6 +307,17 @@ class UAHS(nn.Module):
         return hierarchy.fine_face_values_to_vertices(face_mask) > 0
 
     @staticmethod
+    def _temporal_motion_magnitude(features, batch_size, time_steps):
+        """Return selector-independent per-vertex frame-difference magnitude."""
+        sequence = features.reshape(
+            batch_size, time_steps, features.shape[1], features.shape[2]
+        )
+        if time_steps <= 1:
+            return sequence.new_zeros(sequence.shape[:-1])
+        delta = (sequence[:, 1:] - sequence[:, :-1]).abs().mean(dim=-1)
+        return torch.cat((torch.zeros_like(delta[:, :1]), delta), dim=1)
+
+    @staticmethod
     def _scatter_refinement(base, selected_candidate, query_pairs, weight, norm):
         if query_pairs.shape[0] == 0:
             return norm(base)
@@ -461,6 +472,14 @@ class UAHS(nn.Module):
         candidate_input_l5 = self.pos_drop(
             raw_l5 + self.context_projection_l5(base_l5)
         )
+        motion_faces_l5 = None
+        if self.refinement_head_l5.use_motion:
+            motion_vertices_l5 = self._temporal_motion_magnitude(
+                candidate_input_l5, batch_size, time_steps
+            )
+            motion_faces_l5 = self.hierarchy_l5_l6.vertex_values_to_faces(
+                motion_vertices_l5, level="coarse"
+            )
         candidate_l5, query_pairs_l5 = self.sparse_refiner_l5(
             candidate_input_l5,
             selected_vertices_l5.reshape(batch_frames, -1),
@@ -486,7 +505,7 @@ class UAHS(nn.Module):
         )
         uncertainty_l5 = self.uncertainty_head_l5(face_l5)
         refine_logits_l5, refine_score_l5 = self.refinement_head_l5(
-            face_l5, uncertainty_l5
+            face_l5, uncertainty_l5, motion_faces_l5
         )
         eligible_l5 = child_faces_l5.bool()
         score_l5 = self._selection_scores(

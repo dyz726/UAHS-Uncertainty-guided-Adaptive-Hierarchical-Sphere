@@ -138,6 +138,26 @@ def gradient_report(module):
     return {"exists": True, "finite": finite, "norm": float(norm)}
 
 
+def tensor_statistics(tensor):
+    values = tensor.detach().float()
+    return {
+        "mean": float(values.mean()),
+        "std": float(values.std(unbiased=False)),
+        "min": float(values.min()),
+        "max": float(values.max()),
+    }
+
+
+def temporal_mask_iou(mask):
+    """Mean face IoU between consecutive hard masks."""
+    mask = mask.detach().bool()
+    if mask.shape[1] <= 1:
+        return None
+    intersection = (mask[:, 1:] & mask[:, :-1]).sum(dim=-1).float()
+    union = (mask[:, 1:] | mask[:, :-1]).sum(dim=-1).float()
+    return float((intersection / union.clamp_min(1)).mean())
+
+
 def output_report(model, outputs, batch_size, time_steps):
     expected = {
         "saliency": (batch_size, time_steps, model.hierarchy_l5_l6.fine_vertex_count),
@@ -267,6 +287,16 @@ def run_preflight(sequence_length=12, iterations=3):
                     bool(torch.isfinite(value))
                     for name, value in losses.items()
                     if name.startswith("loss_")
+                ),
+                "uncertainty_l4": tensor_statistics(outputs["uncertainty_l4"]),
+                "uncertainty_l5": tensor_statistics(outputs["uncertainty_l5"]),
+                "refine_score_l4": tensor_statistics(outputs["refine_score_l4"]),
+                "refine_score_l5": tensor_statistics(outputs["refine_score_l5"]),
+                "temporal_mask_iou_l4": temporal_mask_iou(
+                    outputs["hard_face_mask_l4"]
+                ),
+                "temporal_mask_iou_l5": temporal_mask_iou(
+                    outputs["hard_face_mask_l5_effective"]
                 ),
                 "selected_area_l1": float(outputs["selected_area_l1"].mean()),
                 "selected_area_l2": float(outputs["selected_area_l2"].mean()),

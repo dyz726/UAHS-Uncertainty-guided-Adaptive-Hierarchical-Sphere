@@ -24,7 +24,7 @@ def model_args(model_type="uahs", img_rank=3):
         scale_factor=2,
         num_scales=1,
         scale_depth=1,
-        win_size_coef=1,
+        win_size_coef=2,
         temporal_window_radius=1,
         d_head_coef=1,
         enc_num_heads=[2],
@@ -33,7 +33,7 @@ def model_args(model_type="uahs", img_rank=3):
         abs_pos_enc_in=True,
         abs_pos_enc=True,
         rel_pos_bias=True,
-        rel_pos_bias_size=3,
+        rel_pos_bias_size=7,
         rel_pos_init_variance=0.0,
         downsample="center",
         upsample="interpolate",
@@ -134,17 +134,17 @@ def sparse_attention_equivalence_test():
     arguments = dict(
         rank=2,
         icosphere_ref=ref,
-        win_size_coef=1,
+        win_size_coef=2,
         num_heads=2,
         d_model=8,
         d_head_coef=1,
         qkv_bias=True,
         attn_drop=0.0,
         out_drop=0.0,
-        abs_pos_enc=False,
-        abs_pos_enc_size=0,
+        abs_pos_enc=True,
+        abs_pos_enc_size=32,
         rel_pos_bias=True,
-        rel_pos_bias_size=3,
+        rel_pos_bias_size=7,
         rel_pos_init_variance=0.0,
         append_self=False,
     )
@@ -153,11 +153,12 @@ def sparse_attention_equivalence_test():
     sparse.load_state_dict(dense.state_dict(), strict=True)
     dense_input = torch.randn(2, 162, 8, requires_grad=True)
     sparse_input = dense_input.detach().clone().requires_grad_(True)
+    position = torch.randn(1, 162, 32)
     selected = torch.zeros(2, 162, dtype=torch.bool)
     selected[0, ::7] = True
     selected[1, 3::11] = True
-    dense_output = dense(dense_input, None)
-    sparse_output, pairs = sparse(sparse_input, selected, None)
+    dense_output = dense(dense_input, position)
+    sparse_output, pairs = sparse(sparse_input, selected, position)
     dense_selected = dense_output[pairs[:, 0], pairs[:, 1]]
     forward_difference = (dense_selected - sparse_output).abs().max()
     assert float(forward_difference) < 1e-5
@@ -165,10 +166,10 @@ def sparse_attention_equivalence_test():
     sparse_output.square().sum().backward()
     input_gradient_difference = (dense_input.grad - sparse_input.grad).abs().max()
     assert float(input_gradient_difference) < 1e-5
+    sparse_parameters = dict(sparse.named_parameters())
     parameter_gradient_difference = max(
-        float((dense_parameter.grad - sparse_parameter.grad).abs().max())
-        for (_, dense_parameter), (_, sparse_parameter)
-        in zip(dense.named_parameters(), sparse.named_parameters())
+        float((dense_parameter.grad - sparse_parameters[name].grad).abs().max())
+        for name, dense_parameter in dense.named_parameters()
     )
     assert parameter_gradient_difference < 1e-5
     assert sparse.last_query_count == int(selected.sum())
@@ -222,6 +223,71 @@ def warmup_randomness_test():
     )
     assert torch.equal(diagnostic_first, diagnostic_second)
     print("warm-up RNG advances; diagnostic random selector is reproducible: OK")
+
+
+def routing_independent_l5_motion_test():
+    torch.manual_seed(23)
+    model = build_saliency_model(model_args("uahs", img_rank=3)).eval()
+    frame = torch.randn(1, 1, 642, 3)
+    video = frame.repeat(1, 2, 1, 1)
+    with torch.no_grad():
+        reference = model(video, return_aux=True)
+    base_mask = reference["hard_face_mask_l4"][:, :1]
+    stable_mask = base_mask.repeat(1, 2, 1)
+    switched_mask = stable_mask.clone()
+    switched_mask[:, 1] = torch.roll(
+        base_mask[:, 0], shifts=base_mask.shape[-1] // 2, dims=-1
+    )
+
+    captured = []
+
+    def capture_motion(_module, inputs):
+        captured.append((inputs[0].detach().clone(), inputs[2].detach().clone()))
+
+    handle = model.refinement_head_l5.register_forward_pre_hook(capture_motion)
+    with torch.no_grad():
+        model(video, return_aux=True, hard_mask_overrides={"l4": stable_mask})
+        stable_content, stable_motion = captured[-1]
+        model(video, return_aux=True, hard_mask_overrides={"l4": switched_mask})
+        switched_content, switched_motion = captured[-1]
+    handle.remove()
+
+    content_motion_stable = (
+        stable_content[:, 1] - stable_content[:, 0]
+    ).abs().mean()
+    content_motion_switched = (
+        switched_content[:, 1] - switched_content[:, 0]
+    ).abs().mean()
+    assert content_motion_switched > content_motion_stable + 1e-6
+    assert torch.equal(stable_motion, switched_motion)
+    print(
+        "L5 motion is routing-independent: OK",
+        f"old_source={float(content_motion_switched):.3e}",
+        f"new_cue_diff={float((stable_motion - switched_motion).abs().max()):.3e}",
+    )
+
+
+def sparse_scatter_reconstruction_test():
+    torch.manual_seed(29)
+    model = build_saliency_model(model_args("uahs", img_rank=3))
+    base = torch.randn(2, 9, model.embed_dim)
+    query_pairs = torch.tensor([[0, 2], [0, 7], [1, 4]])
+    selected_candidate = torch.randn(3, model.embed_dim)
+    weight = torch.ones(2, 9)
+    reconstructed = model._scatter_refinement(
+        base,
+        selected_candidate,
+        query_pairs,
+        weight,
+        model.fusion_norm_l5,
+    )
+    base_only = model.fusion_norm_l5(base)
+    selected_mask = torch.zeros(2, 9, dtype=torch.bool)
+    selected_mask[query_pairs[:, 0], query_pairs[:, 1]] = True
+    assert torch.equal(reconstructed[~selected_mask], base_only[~selected_mask])
+    assert bool((reconstructed[~selected_mask].abs().sum(dim=-1) > 0).all())
+    assert not torch.equal(reconstructed[selected_mask], base_only[selected_mask])
+    print("sparse scatter preserves non-selected base features: OK")
 
 
 def uahs_training_and_no_gt_leak_test():
@@ -354,6 +420,8 @@ def main():
     sparse_attention_equivalence_test()
     global_attention_test()
     warmup_randomness_test()
+    routing_independent_l5_motion_test()
+    sparse_scatter_reconstruction_test()
     uahs_training_and_no_gt_leak_test()
     baseline_regression_test()
     print("UAHS smoke test: PASS")
