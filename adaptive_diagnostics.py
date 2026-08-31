@@ -190,14 +190,13 @@ def build_uahs_selection_targets(
 
 
 class HierarchicalLevelDiagnostics:
-    """Streaming uncertainty, gate, and selection evidence for one level."""
+    """Streaming uncertainty and hard-selection evidence for one level."""
 
     def __init__(self, target_ratio):
         self.target_ratio = float(target_ratio)
         self.uncertainty = RunningMoments()
         self.error = RunningMoments()
-        self.refine_score = RunningMoments()
-        self.gate = RunningMoments()
+        self.hard_mask = RunningMoments()
         self.area_ratio = RunningMoments()
         self.uncertainty_error = RunningPairMoments()
         self.spearman = RunningMoments()
@@ -210,8 +209,7 @@ class HierarchicalLevelDiagnostics:
             self,
             uncertainty,
             error,
-            refine_score,
-            gate,
+            hard_mask,
             area_ratio,
             predicted_selection,
             target_selection,
@@ -219,8 +217,7 @@ class HierarchicalLevelDiagnostics:
     ):
         self.uncertainty.update(uncertainty)
         self.error.update(error)
-        self.refine_score.update(refine_score)
-        self.gate.update(gate)
+        self.hard_mask.update(hard_mask)
         self.area_ratio.update(area_ratio)
         self.uncertainty_error.update(uncertainty, error)
         self.calibration.update(uncertainty, error)
@@ -253,8 +250,7 @@ class HierarchicalLevelDiagnostics:
                 ),
                 "calibration_bins": self.calibration.summary(),
             },
-            "refine_score": self.refine_score.summary(),
-            "gate": self.gate.summary(),
+            "hard_mask": self.hard_mask.summary(),
             "actual_refinement_area": {
                 **area_ratio,
                 "target": self.target_ratio,
@@ -301,12 +297,10 @@ class UAHSDiagnosticsAccumulator:
             "saliency",
             "saliency_l4",
             "uncertainty_l4",
-            "refine_score_l4",
             "hard_face_mask_l4",
             "selected_area_l1",
             "saliency_l5",
             "uncertainty_l5",
-            "refine_score_l5",
             "hard_face_mask_l5_effective",
             "selected_area_l2",
             "selected_vertex_ratio_l5",
@@ -350,7 +344,6 @@ class UAHSDiagnosticsAccumulator:
             self.level_l4.update(
                 outputs["uncertainty_l4"][valid],
                 targets["error_l4"][valid],
-                outputs["refine_score_l4"][valid],
                 outputs["hard_face_mask_l4"][valid],
                 outputs["selected_area_l1"][valid],
                 predicted_l4[valid],
@@ -360,7 +353,6 @@ class UAHSDiagnosticsAccumulator:
             self.level_l5.update(
                 outputs["uncertainty_l5"][valid],
                 targets["error_l5"][valid],
-                outputs["refine_score_l5"][valid],
                 outputs["hard_face_mask_l5_effective"][valid],
                 outputs["selected_area_l2"][valid],
                 predicted_l5[valid],

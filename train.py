@@ -96,21 +96,8 @@ parser.add_argument("--lambda_saliency_l4", type=float, default=0.15)
 parser.add_argument("--lambda_saliency_l5", type=float, default=0.15)
 parser.add_argument("--lambda_uncertainty_l4", type=float, default=0.05)
 parser.add_argument("--lambda_uncertainty_l5", type=float, default=0.05)
-parser.add_argument("--lambda_refine_l4", type=float, default=0.1)
-parser.add_argument("--lambda_refine_l5", type=float, default=0.1)
 parser.add_argument("--global_query_chunk_size", type=int, default=128)
 parser.add_argument("--hard_selection_warmup_epochs", type=int, default=0)
-parser.add_argument(
-    "--disable_uncertainty_refinement",
-    dest="use_uncertainty_refinement",
-    action="store_false",
-    help="predict uncertainty but do not feed it to the refinement head",
-)
-parser.add_argument(
-    "--disable_motion_refinement",
-    dest="use_motion_refinement",
-    action="store_false",
-)
 parser.add_argument("--return_aux", action="store_true")
 parser.add_argument("--debug_uahs", action="store_true")
 
@@ -215,8 +202,8 @@ if __name__ == "__main__":
     --dataset_root_dir /home/dyz/PythonProject/Dataset/Sports-360 \
     --mode vertex \
     --img_rank 6 \
-    --seq_length 16 \
-    --temporal_window_radius 5 \
+    --seq_length 12 \
+    --temporal_window_radius none \
     --coarse_pool_type mean_max \
     --target_refine_ratio_l1 0.25 \
     --target_refine_ratio_l2 0.125 \
@@ -226,16 +213,15 @@ if __name__ == "__main__":
     --lambda_saliency_l5 0.15 \
     --lambda_uncertainty_l4 0.05 \
     --lambda_uncertainty_l5 0.05 \
-    --lambda_refine_l4 0.1 \
-    --lambda_refine_l5 0.1 \
     --train_batch_size 1 \
     --val_batch_size 1 \
     --num_workers 8 \
     --num_epochs 100 \
-    --optimizer adam \
+    --optimizer adamw \
     --learning_rate 1e-4 \
     --min_learning_rate 1e-6 \
-    --lr_scheduler reduce_on_plateau \
+    --warmup_epochs 3 \
+    --lr_scheduler warmup_cosine \
     --weight_decay 1e-4 \
     --use_checkpoint 1 \
     --accum_grads 1 \

@@ -7,10 +7,8 @@ import tqdm
 import wandb              
 import numpy as np
 import cv2
-import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
-from adaptive_objectives import build_fixed_area_target
 from data.get_saliency_dataloaders import get_dataloaders         
 from network.sphere_model import build_saliency_model
 from Sphere_SalientScore_torch import *
@@ -43,12 +41,6 @@ class Trainer:
             lambda_saliency_l5=args.lambda_saliency_l5,
             lambda_uncertainty_l4=args.lambda_uncertainty_l4,
             lambda_uncertainty_l5=args.lambda_uncertainty_l5,
-            lambda_refine_l4=args.lambda_refine_l4,
-            lambda_refine_l5=args.lambda_refine_l5,
-            use_uncertainty_refinement=getattr(
-                args, "use_uncertainty_refinement", True
-            ),
-            use_motion_refinement=args.use_motion_refinement,
         )
 
                     
@@ -141,8 +133,6 @@ class Trainer:
             args.lambda_saliency_l5,
             args.lambda_uncertainty_l4,
             args.lambda_uncertainty_l5,
-            args.lambda_refine_l4,
-            args.lambda_refine_l5,
         )
         if min(loss_weights) < 0:
             raise ValueError("UAHS loss weights must be non-negative")
@@ -505,24 +495,8 @@ class Trainer:
         weights = weights / weights.sum()
         return (values * weights.reshape(1, 1, -1)).sum(dim=-1).mean()
 
-    @staticmethod
-    def area_weighted_masked_mean(values, face_areas, mask):
-        """Average within each sample's eligible spherical parent area."""
-        weights = face_areas.to(
-            device=values.device, dtype=values.dtype
-        ).reshape(1, 1, -1)
-        weights = weights * mask.to(dtype=values.dtype)
-        denominator = weights.sum(dim=-1)
-        numerator = (values * weights).sum(dim=-1)
-        per_sample = torch.where(
-            denominator > 0,
-            numerator / denominator.clamp_min(1e-8),
-            torch.zeros_like(numerator),
-        )
-        return per_sample.mean()
-
     def compute_uahs_losses(self, ground_truth, outputs):
-        """Compute hard-hierarchy auxiliary losses; labels never enter forward."""
+        """Supervise saliency and predictive uncertainty; labels stay in loss."""
         B, T = ground_truth.shape[:2]
         target_l4 = self.model.aggregate_img_values_to_l4_faces(ground_truth)
         target_l5 = self.model.aggregate_img_values_to_l5_faces(ground_truth)
@@ -555,53 +529,11 @@ class Trainer:
         loss_uncertainty_l5 = self.area_weighted_mean(
             laplace_l5, self.model.hierarchy_l5_l6.coarse_face_areas
         )
-
-        difficulty_l4 = (target_l4 - saliency_l4.detach()).abs()
-        target_ratio_l1 = self.args.target_refine_ratio_l1
-        target_ratio_l2 = self.args.target_refine_ratio_l2
-        selection_target_l4 = build_fixed_area_target(
-            difficulty_l4,
-            self.model.hierarchy_l4_l5.coarse_face_areas,
-            target_ratio_l1,
-        )
-        eligible_l5 = self.model.hierarchy_l4_l5.propagate_coarse_face_values(
-            selection_target_l4
-        ).bool()
-        difficulty_l5 = (target_l5 - saliency_l5.detach()).abs()
-        selection_target_l5 = build_fixed_area_target(
-            difficulty_l5,
-            self.model.hierarchy_l5_l6.coarse_face_areas,
-            target_ratio_l2,
-            eligible_mask=eligible_l5,
-        )
-
-        refine_bce_l4 = F.binary_cross_entropy_with_logits(
-            outputs["refine_logits_l4"],
-            selection_target_l4,
-            reduction="none",
-        )
-        refine_bce_l5 = F.binary_cross_entropy_with_logits(
-            outputs["refine_logits_l5"],
-            selection_target_l5,
-            reduction="none",
-        )
-        loss_refine_l4 = self.area_weighted_mean(
-            refine_bce_l4, self.model.hierarchy_l4_l5.coarse_face_areas
-        )
-        loss_refine_l5 = self.area_weighted_masked_mean(
-            refine_bce_l5,
-            self.model.hierarchy_l5_l6.coarse_face_areas,
-            eligible_l5,
-        )
         return {
             "loss_saliency_l4": loss_saliency_l4,
             "loss_saliency_l5": loss_saliency_l5,
             "loss_uncertainty_l4": loss_uncertainty_l4,
             "loss_uncertainty_l5": loss_uncertainty_l5,
-            "loss_refine_l4": loss_refine_l4,
-            "loss_refine_l5": loss_refine_l5,
-            "selection_target_l4": selection_target_l4,
-            "selection_target_l5": selection_target_l5,
         }
 
     def train_one_epoch(self):
@@ -773,10 +705,6 @@ class Trainer:
                 * auxiliary_losses["loss_uncertainty_l4"]
                 + self.args.lambda_uncertainty_l5
                 * auxiliary_losses["loss_uncertainty_l5"]
-                + self.args.lambda_refine_l4
-                * auxiliary_losses["loss_refine_l4"]
-                + self.args.lambda_refine_l5
-                * auxiliary_losses["loss_refine_l5"]
             )
 
         outputs = {"pred_sal": pred_sal.detach()}

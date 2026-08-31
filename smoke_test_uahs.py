@@ -50,16 +50,12 @@ def model_args(model_type="uahs", img_rank=3):
         target_refine_ratio_l2=0.125,
         global_query_chunk_size=32,
         hard_selection_warmup_epochs=0,
-        use_uncertainty_refinement=True,
-        use_motion_refinement=True,
         return_aux=False,
         debug_uahs=False,
         lambda_saliency_l4=0.15,
         lambda_saliency_l5=0.15,
         lambda_uncertainty_l4=0.05,
         lambda_uncertainty_l5=0.05,
-        lambda_refine_l4=0.1,
-        lambda_refine_l5=0.1,
     )
 
 
@@ -199,72 +195,29 @@ def global_attention_test():
 
 def warmup_randomness_test():
     model = build_saliency_model(model_args("uahs", img_rank=3))
-    logits = torch.zeros(1, 2, model.hierarchy_l4_l5.coarse_face_count)
-    uncertainty = torch.zeros_like(logits)
-    saliency = torch.zeros_like(logits)
+    uncertainty = torch.zeros(1, 2, model.hierarchy_l4_l5.coarse_face_count)
+    saliency = torch.zeros_like(uncertainty)
 
     model.train()
     model.hard_selection_warmup_epochs = 1
     model.set_epoch(1)
     warmup_first = model._selection_scores(
-        "learned_refinement_score", logits, uncertainty, saliency, seed=0
+        "uncertainty_only", uncertainty, saliency, seed=0
     )
     warmup_second = model._selection_scores(
-        "learned_refinement_score", logits, uncertainty, saliency, seed=0
+        "uncertainty_only", uncertainty, saliency, seed=0
     )
     assert not torch.equal(warmup_first, warmup_second)
 
     model.eval()
     diagnostic_first = model._selection_scores(
-        "random_same_budget", logits, uncertainty, saliency, seed=17
+        "random_same_budget", uncertainty, saliency, seed=17
     )
     diagnostic_second = model._selection_scores(
-        "random_same_budget", logits, uncertainty, saliency, seed=17
+        "random_same_budget", uncertainty, saliency, seed=17
     )
     assert torch.equal(diagnostic_first, diagnostic_second)
     print("warm-up RNG advances; diagnostic random selector is reproducible: OK")
-
-
-def routing_independent_l5_motion_test():
-    torch.manual_seed(23)
-    model = build_saliency_model(model_args("uahs", img_rank=3)).eval()
-    frame = torch.randn(1, 1, 642, 3)
-    video = frame.repeat(1, 2, 1, 1)
-    with torch.no_grad():
-        reference = model(video, return_aux=True)
-    base_mask = reference["hard_face_mask_l4"][:, :1]
-    stable_mask = base_mask.repeat(1, 2, 1)
-    switched_mask = stable_mask.clone()
-    switched_mask[:, 1] = torch.roll(
-        base_mask[:, 0], shifts=base_mask.shape[-1] // 2, dims=-1
-    )
-
-    captured = []
-
-    def capture_motion(_module, inputs):
-        captured.append((inputs[0].detach().clone(), inputs[2].detach().clone()))
-
-    handle = model.refinement_head_l5.register_forward_pre_hook(capture_motion)
-    with torch.no_grad():
-        model(video, return_aux=True, hard_mask_overrides={"l4": stable_mask})
-        stable_content, stable_motion = captured[-1]
-        model(video, return_aux=True, hard_mask_overrides={"l4": switched_mask})
-        switched_content, switched_motion = captured[-1]
-    handle.remove()
-
-    content_motion_stable = (
-        stable_content[:, 1] - stable_content[:, 0]
-    ).abs().mean()
-    content_motion_switched = (
-        switched_content[:, 1] - switched_content[:, 0]
-    ).abs().mean()
-    assert content_motion_switched > content_motion_stable + 1e-6
-    assert torch.equal(stable_motion, switched_motion)
-    print(
-        "L5 motion is routing-independent: OK",
-        f"old_source={float(content_motion_switched):.3e}",
-        f"new_cue_diff={float((stable_motion - switched_motion).abs().max()):.3e}",
-    )
 
 
 def sparse_scatter_reconstruction_test():
@@ -290,6 +243,43 @@ def sparse_scatter_reconstruction_test():
     print("sparse scatter preserves non-selected base features: OK")
 
 
+def evaluation_ablation_test():
+    """Verify the no-L6 evaluation ablation without changing routing."""
+    torch.manual_seed(31)
+    model = build_saliency_model(model_args("uahs", img_rank=3)).eval()
+    inputs = torch.randn(1, 2, 642, 3)
+    with torch.no_grad():
+        uncertainty_routed = model(inputs, return_aux=True)
+        no_l6 = model(
+            inputs,
+            return_aux=True,
+            hard_mask_overrides={
+                "l4": uncertainty_routed["hard_face_mask_l4"],
+                "l5": uncertainty_routed["hard_face_mask_l5_effective"],
+            },
+            disable_l6_refinement=True,
+        )
+
+    for mask_name in (
+            "hard_face_mask_l4",
+            "hard_face_mask_l5_effective",
+    ):
+        assert torch.equal(uncertainty_routed[mask_name], no_l6[mask_name])
+    assert int(no_l6["selected_spatial_queries_l6"].sum()) == 0
+    assert torch.equal(uncertainty_routed["saliency_l4"], no_l6["saliency_l4"])
+    assert torch.equal(uncertainty_routed["saliency_l5"], no_l6["saliency_l5"])
+    assert_finite("no-L6 final saliency", no_l6["saliency"])
+
+    model.train()
+    try:
+        model(inputs, disable_l6_refinement=True)
+    except ValueError as error:
+        assert "evaluation-only" in str(error)
+    else:
+        raise AssertionError("Training unexpectedly accepted the no-L6 ablation")
+    print("no-L6 same-head uncertainty-routing ablation: OK")
+
+
 def uahs_training_and_no_gt_leak_test():
     torch.manual_seed(1)
     args = model_args("uahs", img_rank=3)
@@ -302,13 +292,17 @@ def uahs_training_and_no_gt_leak_test():
         "saliency",
         "uncertainty_l4",
         "uncertainty_l5",
-        "refine_score_l4",
-        "refine_score_l5",
         "hard_face_mask_l4",
         "hard_face_mask_l5_effective",
     )
     for key in forward_keys:
         assert torch.equal(first[key], second[key]), f"{key} is not deterministic"
+    assert not any(
+        name.startswith(("refine_", "motion_")) for name in first
+    )
+    assert not any(
+        "refinement_head" in name for name, _module in model.named_modules()
+    )
 
     for mode in model.SELECTOR_MODES:
         selected = model(inputs, return_aux=True, selector_mode=mode)
@@ -337,11 +331,9 @@ def uahs_training_and_no_gt_leak_test():
         "saliency": (1, 2, 642),
         "saliency_l4": (1, 2, 80),
         "uncertainty_l4": (1, 2, 80),
-        "refine_logits_l4": (1, 2, 80),
         "hard_face_mask_l4": (1, 2, 80),
         "saliency_l5": (1, 2, 320),
         "uncertainty_l5": (1, 2, 320),
-        "refine_logits_l5": (1, 2, 320),
         "hard_face_mask_l5_effective": (1, 2, 320),
         "exit_level": (1, 2, 642),
     }
@@ -363,15 +355,18 @@ def uahs_training_and_no_gt_leak_test():
     trainer.args = args
     trainer.loss_kl_cc = Trainer.loss_kl_cc.__get__(trainer, Trainer)
     trainer.area_weighted_mean = Trainer.area_weighted_mean
-    trainer.area_weighted_masked_mean = Trainer.area_weighted_masked_mean
     ground_truth_a = torch.rand(1, 2, 642)
     ground_truth_b = torch.rand(1, 2, 642)
-    # Labels only change targets/losses; forward tensors were already fixed.
+    # Labels only change loss values; forward routing was already fixed.
     losses_a = trainer.compute_uahs_losses(ground_truth_a, first)
     losses_b = trainer.compute_uahs_losses(ground_truth_b, first)
-    assert not torch.equal(
-        losses_a["selection_target_l4"], losses_b["selection_target_l4"]
-    )
+    assert set(losses_a) == {
+        "loss_saliency_l4",
+        "loss_saliency_l5",
+        "loss_uncertainty_l4",
+        "loss_uncertainty_l5",
+    }
+    assert not torch.equal(losses_a["loss_uncertainty_l4"], losses_b["loss_uncertainty_l4"])
 
     model.train()
     outputs = model(inputs, return_aux=True)
@@ -389,8 +384,8 @@ def uahs_training_and_no_gt_leak_test():
             ("sparse L6", model.sparse_refiner_l6),
             ("uncertainty L4", model.uncertainty_head_l4),
             ("uncertainty L5", model.uncertainty_head_l5),
-            ("refinement L4", model.refinement_head_l4),
-            ("refinement L5", model.refinement_head_l5),
+            ("saliency L4", model.saliency_head_l4),
+            ("saliency L5", model.saliency_head_l5),
             ("final saliency", model.output_proj),
     ):
         assert_gradient(name, module)
@@ -420,8 +415,8 @@ def main():
     sparse_attention_equivalence_test()
     global_attention_test()
     warmup_randomness_test()
-    routing_independent_l5_motion_test()
     sparse_scatter_reconstruction_test()
+    evaluation_ablation_test()
     uahs_training_and_no_gt_leak_test()
     baseline_regression_test()
     print("UAHS smoke test: PASS")

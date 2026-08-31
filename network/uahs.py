@@ -17,7 +17,6 @@ from .sphere_model import (
     InputProj,
     InterpolateUpsample,
     OutputProj,
-    RefinementHead,
     SphereUFormerModule,
     SphericalUncertaintyHead,
     VertexToFaceAggregation,
@@ -61,7 +60,6 @@ class UAHS(nn.Module):
     """
 
     SELECTOR_MODES = {
-        "learned_refinement_score",
         "uncertainty_only",
         "saliency_score",
         "random_same_budget",
@@ -102,8 +100,6 @@ class UAHS(nn.Module):
             target_refine_ratio_l2: float = 0.125,
             global_query_chunk_size: int = 128,
             hard_selection_warmup_epochs: int = 0,
-            use_uncertainty_refinement: bool = True,
-            use_motion_refinement: bool = True,
             return_aux: bool = False,
             debug_uahs: bool = False,
     ):
@@ -244,16 +240,6 @@ class UAHS(nn.Module):
         self.saliency_head_l5 = nn.Linear(embed_dim, out_channels)
         self.uncertainty_head_l4 = SphericalUncertaintyHead(embed_dim)
         self.uncertainty_head_l5 = SphericalUncertaintyHead(embed_dim)
-        self.refinement_head_l4 = RefinementHead(
-            embed_dim,
-            use_uncertainty=use_uncertainty_refinement,
-            use_motion=use_motion_refinement,
-        )
-        self.refinement_head_l5 = RefinementHead(
-            embed_dim,
-            use_uncertainty=use_uncertainty_refinement,
-            use_motion=use_motion_refinement,
-        )
         self.hard_selector_l4 = HardAreaSelector(target_refine_ratio_l1)
         self.hard_selector_l5 = HardAreaSelector(target_refine_ratio_l2)
         self.fusion_norm_l5 = norm_layer(embed_dim)
@@ -307,17 +293,6 @@ class UAHS(nn.Module):
         return hierarchy.fine_face_values_to_vertices(face_mask) > 0
 
     @staticmethod
-    def _temporal_motion_magnitude(features, batch_size, time_steps):
-        """Return selector-independent per-vertex frame-difference magnitude."""
-        sequence = features.reshape(
-            batch_size, time_steps, features.shape[1], features.shape[2]
-        )
-        if time_steps <= 1:
-            return sequence.new_zeros(sequence.shape[:-1])
-        delta = (sequence[:, 1:] - sequence[:, :-1]).abs().mean(dim=-1)
-        return torch.cat((torch.zeros_like(delta[:, :1]), delta), dim=1)
-
-    @staticmethod
     def _scatter_refinement(base, selected_candidate, query_pairs, weight, norm):
         if query_pairs.shape[0] == 0:
             return norm(base)
@@ -334,7 +309,6 @@ class UAHS(nn.Module):
     def _selection_scores(
             self,
             mode,
-            refine_logits,
             uncertainty,
             saliency,
             seed,
@@ -350,22 +324,22 @@ class UAHS(nn.Module):
             # Training warm-up must explore different regions on successive
             # batches. Use the process RNG instead of recreating a fixed-seed
             # generator on every forward.
-            return torch.rand_like(refine_logits)
+            return torch.rand_like(uncertainty)
         if mode == "random_same_budget":
             # Evaluation baselines remain reproducible for a requested seed.
-            generator = torch.Generator(device=refine_logits.device)
+            generator = torch.Generator(device=uncertainty.device)
             generator.manual_seed(int(seed or 0))
             return torch.rand(
-                refine_logits.shape,
-                device=refine_logits.device,
-                dtype=refine_logits.dtype,
+                uncertainty.shape,
+                device=uncertainty.device,
+                dtype=uncertainty.dtype,
                 generator=generator,
             )
         if mode == "uncertainty_only":
             return uncertainty.detach()
         if mode == "saliency_score":
             return saliency.detach()
-        return refine_logits.detach()
+        raise AssertionError("Unreachable selector mode")
 
     def aggregate_img_values_to_l5_faces(self, values: Tensor) -> Tensor:
         rank6_faces = self.hierarchy_l5_l6.vertex_values_to_faces(
@@ -399,11 +373,22 @@ class UAHS(nn.Module):
             self,
             x: Tensor,
             return_aux: Optional[bool] = None,
-            selector_mode: str = "learned_refinement_score",
+            selector_mode: str = "uncertainty_only",
             selector_seed: int = 0,
             hard_mask_overrides: Optional[dict] = None,
+            disable_l6_refinement: bool = False,
     ):
-        """Predict saliency without labels; overrides are evaluation-only masks."""
+        """Predict saliency without labels; overrides are evaluation-only masks.
+
+        ``disable_l6_refinement`` is an evaluation-only ablation. It preserves
+        the uncertainty-based L4/L5 routing, dense L5 representation, L5->L6 base
+        reconstruction, fusion normalization, and final output head, while
+        skipping only the selected-query rank-6 residual computation.
+        """
+        if disable_l6_refinement and self.training:
+            raise ValueError(
+                "disable_l6_refinement is an evaluation-only ablation"
+            )
         if x.ndim != 4:
             raise ValueError(f"Expected [B,T,V,C], got {tuple(x.shape)}")
         batch_size, time_steps, vertices_l6, channels = x.shape
@@ -438,12 +423,8 @@ class UAHS(nn.Module):
             self.saliency_head_l4(face_l4).squeeze(-1)
         )
         uncertainty_l4 = self.uncertainty_head_l4(face_l4)
-        refine_logits_l4, refine_score_l4 = self.refinement_head_l4(
-            face_l4, uncertainty_l4
-        )
         score_l4 = self._selection_scores(
             selector_mode,
-            refine_logits_l4,
             uncertainty_l4,
             saliency_l4,
             selector_seed,
@@ -461,9 +442,9 @@ class UAHS(nn.Module):
         selected_vertices_l5 = self._vertex_mask(
             self.hierarchy_l4_l5, child_faces_l5
         )
-        weight_faces_l5 = child_faces_l5 * self.hierarchy_l4_l5.propagate_coarse_face_values(
-            torch.sigmoid(refine_logits_l4)
-        )
+        # The hard mask decides compute and reconstruction. Face-to-vertex mean
+        # reduction naturally gives fractional weights only at region borders.
+        weight_faces_l5 = child_faces_l5
         weight_vertices_l5 = self.hierarchy_l4_l5.fine_face_values_to_vertices(
             weight_faces_l5
         )
@@ -472,14 +453,6 @@ class UAHS(nn.Module):
         candidate_input_l5 = self.pos_drop(
             raw_l5 + self.context_projection_l5(base_l5)
         )
-        motion_faces_l5 = None
-        if self.refinement_head_l5.use_motion:
-            motion_vertices_l5 = self._temporal_motion_magnitude(
-                candidate_input_l5, batch_size, time_steps
-            )
-            motion_faces_l5 = self.hierarchy_l5_l6.vertex_values_to_faces(
-                motion_vertices_l5, level="coarse"
-            )
         candidate_l5, query_pairs_l5 = self.sparse_refiner_l5(
             candidate_input_l5,
             selected_vertices_l5.reshape(batch_frames, -1),
@@ -504,13 +477,9 @@ class UAHS(nn.Module):
             self.saliency_head_l5(face_l5).squeeze(-1)
         )
         uncertainty_l5 = self.uncertainty_head_l5(face_l5)
-        refine_logits_l5, refine_score_l5 = self.refinement_head_l5(
-            face_l5, uncertainty_l5, motion_faces_l5
-        )
         eligible_l5 = child_faces_l5.bool()
         score_l5 = self._selection_scores(
             selector_mode,
-            refine_logits_l5,
             uncertainty_l5,
             saliency_l5,
             selector_seed + 1,
@@ -533,28 +502,31 @@ class UAHS(nn.Module):
         selected_vertices_l6 = self._vertex_mask(
             self.hierarchy_l5_l6, child_faces_l6
         )
-        weight_faces_l6 = child_faces_l6 * self.hierarchy_l5_l6.propagate_coarse_face_values(
-            torch.sigmoid(refine_logits_l5)
-        )
+        weight_faces_l6 = child_faces_l6
         weight_vertices_l6 = self.hierarchy_l5_l6.fine_face_values_to_vertices(
             weight_faces_l6
         )
 
         base_l6 = self.upsample_l5_l6(features_l5)
-        candidate_input_l6 = self.pos_drop(
-            raw_l6 + self.context_projection_l6(base_l6)
-        )
-        candidate_l6, query_pairs_l6 = self.sparse_refiner_l6(
-            candidate_input_l6,
-            selected_vertices_l6.reshape(batch_frames, -1),
-        )
-        features_l6 = self._scatter_refinement(
-            base_l6,
-            candidate_l6,
-            query_pairs_l6,
-            weight_vertices_l6.reshape(batch_frames, -1),
-            self.fusion_norm_l6,
-        )
+        if disable_l6_refinement:
+            # This is exactly the no-query branch of _scatter_refinement and
+            # therefore keeps the reconstruction/output path comparable.
+            features_l6 = self.fusion_norm_l6(base_l6)
+        else:
+            candidate_input_l6 = self.pos_drop(
+                raw_l6 + self.context_projection_l6(base_l6)
+            )
+            candidate_l6, query_pairs_l6 = self.sparse_refiner_l6(
+                candidate_input_l6,
+                selected_vertices_l6.reshape(batch_frames, -1),
+            )
+            features_l6 = self._scatter_refinement(
+                base_l6,
+                candidate_l6,
+                query_pairs_l6,
+                weight_vertices_l6.reshape(batch_frames, -1),
+                self.fusion_norm_l6,
+            )
         final_logits = self.output_proj(features_l6)
         if self.out_channels == 1:
             saliency = self.final_sigmoid(
@@ -591,7 +563,11 @@ class UAHS(nn.Module):
         active_faces_l5 = child_faces_l5.sum(dim=-1)
         active_faces_l6 = child_faces_l6.sum(dim=-1)
         query_count_l5 = selected_vertices_l5.sum(dim=-1)
-        query_count_l6 = selected_vertices_l6.sum(dim=-1)
+        query_count_l6 = (
+            torch.zeros_like(selected_vertices_l6.sum(dim=-1))
+            if disable_l6_refinement
+            else selected_vertices_l6.sum(dim=-1)
+        )
         dense_query_count_l5 = torch.full_like(
             query_count_l5, self.hierarchy_l4_l5.fine_vertex_count
         )
@@ -628,14 +604,10 @@ class UAHS(nn.Module):
             "saliency": saliency,
             "saliency_l4": saliency_l4,
             "uncertainty_l4": uncertainty_l4,
-            "refine_logits_l4": refine_logits_l4,
-            "refine_score_l4": refine_score_l4,
             "hard_face_mask_l4": hard_l4,
             "selected_area_l1": selected_area_l1,
             "saliency_l5": saliency_l5,
             "uncertainty_l5": uncertainty_l5,
-            "refine_logits_l5": refine_logits_l5,
-            "refine_score_l5": refine_score_l5,
             "hard_face_mask_l5_local": hard_l5_local,
             "hard_face_mask_l5_effective": hard_l5_effective,
             "selected_area_l2": selected_area_l2,

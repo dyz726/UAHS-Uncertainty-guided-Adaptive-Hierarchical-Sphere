@@ -1,7 +1,7 @@
 import random
 import warnings
 from functools import partial
-from typing import Dict, Union, List, Optional, Tuple
+from typing import Dict, Union, List, Optional
 
 import einops
 import torch
@@ -791,57 +791,6 @@ class SphericalUncertaintyHead(nn.Module):
         return F.softplus(raw_scale) + self.epsilon
 
 
-class RefinementHead(nn.Module):
-    """Predict face refinement from content, uncertainty, and motion."""
-
-    def __init__(
-            self,
-            dim: int,
-            use_uncertainty: bool = True,
-            use_motion: bool = True,
-    ):
-        super().__init__()
-        hidden_dim = max(1, dim // 2)
-        self.use_uncertainty = use_uncertainty
-        self.use_motion = use_motion
-        self.refinement_mlp = nn.Sequential(
-            nn.Linear(dim + 2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(
-            self,
-            face_features: Tensor,
-            uncertainty_scale: Tensor,
-            motion_magnitude: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor]:
-        """Return logits and scores for [B, T, Fcoarse, C] features."""
-        if not self.use_motion:
-            motion = torch.zeros_like(face_features[..., :1])
-        elif motion_magnitude is not None:
-            if motion_magnitude.shape != face_features.shape[:-1]:
-                raise ValueError(
-                    "motion_magnitude must match [B, T, Fcoarse]"
-                )
-            motion = motion_magnitude.unsqueeze(-1)
-        elif face_features.shape[1] > 1:
-            delta = (face_features[:, 1:] - face_features[:, :-1]).abs().mean(
-                dim=-1, keepdim=True
-            )
-            motion = torch.cat((torch.zeros_like(delta[:, :1]), delta), dim=1)
-        else:
-            motion = torch.zeros_like(face_features[..., :1])
-        if self.use_uncertainty:
-            # Calibration is governed by L_uncertainty, not by gate gradients.
-            uncertainty = uncertainty_scale.detach().unsqueeze(-1)
-        else:
-            uncertainty = torch.zeros_like(face_features[..., :1])
-        inputs = torch.cat((face_features, uncertainty, motion), dim=-1)
-        logits = self.refinement_mlp(inputs).squeeze(-1)
-        return logits, torch.sigmoid(logits)
-
-
 def build_saliency_model(args, node_type: Optional[str] = None) -> nn.Module:
     """Build the published baseline or final UAHS model."""
     node_type = node_type or args.mode
@@ -894,10 +843,6 @@ def build_saliency_model(args, node_type: Optional[str] = None) -> nn.Module:
         target_refine_ratio_l2=args.target_refine_ratio_l2,
         global_query_chunk_size=args.global_query_chunk_size,
         hard_selection_warmup_epochs=args.hard_selection_warmup_epochs,
-        use_uncertainty_refinement=getattr(
-            args, "use_uncertainty_refinement", True
-        ),
-        use_motion_refinement=args.use_motion_refinement,
         return_aux=args.return_aux,
         debug_uahs=args.debug_uahs,
         **common,

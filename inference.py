@@ -21,6 +21,7 @@ from train import parser
 from trimesh_utils import IcoSphereRef, asSpherical
 
 
+
 class InferenceRunner:
     def __init__(self, args):
         self.args = args
@@ -56,6 +57,10 @@ class InferenceRunner:
             raise ValueError("--uahs_diagnostics requires --model_type uahs")
         if comparison_modes and args.model_type != "uahs":
             raise ValueError("selector comparisons require --model_type uahs")
+        if args.uahs_evaluation_ablations and args.model_type != "uahs":
+            raise ValueError(
+                "--uahs_evaluation_ablations requires --model_type uahs"
+            )
         if args.model_type == "uahs" and not (
                 0 <= args.target_refine_ratio_l2
                 <= args.target_refine_ratio_l1 <= 1
@@ -260,13 +265,13 @@ class InferenceRunner:
 
     def _build_oracle_masks(
             self,
-            learned_outputs,
+            uahs_outputs,
             ground_truth,
             rgb,
     ):
         target_l4 = self.model.aggregate_img_values_to_l4_faces(ground_truth)
         selection_l4 = build_fixed_area_target(
-            (target_l4 - learned_outputs["saliency_l4"]).abs(),
+            (target_l4 - uahs_outputs["saliency_l4"]).abs(),
             self.model.hierarchy_l4_l5.coarse_face_areas,
             self.args.target_refine_ratio_l1,
         )
@@ -292,6 +297,7 @@ class InferenceRunner:
             results,
             comparison_results,
             comparison_area_results,
+            ablation_results,
     ):
         report = self.uahs_diagnostics.summary()
         report["configuration"] = {
@@ -311,6 +317,8 @@ class InferenceRunner:
             "target_refine_ratio_l1": self.args.target_refine_ratio_l1,
             "target_refine_ratio_l2": self.args.target_refine_ratio_l2,
             "max_batches": self.args.max_batches,
+            "uahs_evaluation_ablations": self.args.uahs_evaluation_ablations,
+            "routing": "uncertainty_only",
         }
         if hasattr(self.model, "middle_rank"):
             report["configuration"]["middle_rank"] = self.model.middle_rank
@@ -318,7 +326,6 @@ class InferenceRunner:
             higher_is_better = {"AUC", "NSS", "CC", "SIM"}
             report["selector_comparisons"] = {
                 "definitions": {
-                    "uncertainty_only": "hard area selection ranked by uncertainty",
                     "saliency_score": "hard area selection ranked by saliency",
                     "random_same_budget": (
                         "random hard hierarchy at the same fixed area budgets"
@@ -327,11 +334,11 @@ class InferenceRunner:
                         "GT-error hard hierarchy; diagnostic, not a theoretical upper bound"
                     ),
                 },
-                "learned_refinement_score_metrics": results,
+                "uncertainty_routing_metrics": results,
                 "baselines": {},
             }
             for mode, baseline_results in comparison_results.items():
-                learned_gain = {
+                baseline_gain = {
                     name: (
                         results[name] - baseline_results[name]
                         if name in higher_is_better
@@ -343,8 +350,32 @@ class InferenceRunner:
                 report["selector_comparisons"]["baselines"][mode] = {
                     "metrics": baseline_results,
                     "actual_area_ratio": comparison_area_results.get(mode),
-                    "learned_gain_positive_is_better": learned_gain,
+                    "uncertainty_routing_gain_positive_is_better": baseline_gain,
                 }
+
+        if self.args.uahs_evaluation_ablations:
+            higher_is_better = {"AUC", "NSS", "CC", "SIM"}
+            no_l6_metrics = ablation_results["no_l6_residual"]
+            l6_gain = {
+                name: (
+                    results[name] - no_l6_metrics[name]
+                    if name in higher_is_better
+                    else no_l6_metrics[name] - results[name]
+                )
+                for name in results
+                if name in no_l6_metrics
+            }
+            report["evaluation_ablations"] = {
+                "no_l6_residual": {
+                    "definition": (
+                        "skip only selected-query rank-6 residual computation; "
+                        "keep uncertainty routing, F5->F6 base reconstruction, fusion "
+                        "normalization, and the same final output head"
+                    ),
+                    "metrics": no_l6_metrics,
+                    "l6_gain_positive_is_better": l6_gain,
+                },
+            }
 
         output_path = self.args.diagnostics_output
         if not output_path:
@@ -376,23 +407,35 @@ class InferenceRunner:
             mode: {"level_l1": 0.0, "level_l2": 0.0, "frames": 0}
             for mode in self.comparison_modes
         }
+        ablation_metric_totals = {
+            name: 0.0 for name in metric_totals
+        }
+        ablation_metric_frames = {
+            name: 0 for name in metric_totals
+        }
         progress = tqdm.tqdm(
             self.loader_test, desc=f"{self.args.dataset_name} inference"
         )
         for batch_idx, batch in enumerate(progress):
             device_batch = self._to_device(batch)
             valid_lengths = batch["valid_length"].tolist()
-            if self.uahs_diagnostics is not None:
-                learned_outputs = self.model(
+            need_aux = (
+                self.uahs_diagnostics is not None
+                or self.args.uahs_evaluation_ablations
+                or bool(self.comparison_modes)
+            )
+            if need_aux:
+                uahs_outputs = self.model(
                     device_batch["normalized_sphere_rgb"], return_aux=True
                 )
-                predictions = learned_outputs["saliency"]
-                self.uahs_diagnostics.update(
-                    learned_outputs,
-                    device_batch["normalized_sphere_sal"],
-                    valid_lengths,
-                    self.model,
-                )
+                predictions = uahs_outputs["saliency"]
+                if self.uahs_diagnostics is not None:
+                    self.uahs_diagnostics.update(
+                        uahs_outputs,
+                        device_batch["normalized_sphere_sal"],
+                        valid_lengths,
+                        self.model,
+                    )
             else:
                 predictions = self.model(device_batch["normalized_sphere_rgb"])
                 if isinstance(predictions, dict):
@@ -408,7 +451,7 @@ class InferenceRunner:
             for mode in self.comparison_modes:
                 if mode == "oracle_error_same_budget":
                     mask_overrides = self._build_oracle_masks(
-                        learned_outputs,
+                        uahs_outputs,
                         device_batch["normalized_sphere_sal"],
                         device_batch["normalized_sphere_rgb"],
                     )
@@ -446,6 +489,35 @@ class InferenceRunner:
                     valid_lengths,
                     comparison_metric_totals[mode],
                     comparison_metric_frames[mode],
+                )
+            if self.args.uahs_evaluation_ablations:
+                no_l6_outputs = self.model(
+                    device_batch["normalized_sphere_rgb"],
+                    return_aux=True,
+                    hard_mask_overrides={
+                        "l4": uahs_outputs["hard_face_mask_l4"],
+                        "l5": uahs_outputs[
+                            "hard_face_mask_l5_effective"
+                        ],
+                    },
+                    disable_l6_refinement=True,
+                )
+                for mask_name in (
+                        "hard_face_mask_l4",
+                        "hard_face_mask_l5_effective",
+                ):
+                    if not torch.equal(
+                            uahs_outputs[mask_name], no_l6_outputs[mask_name]
+                    ):
+                        raise RuntimeError(
+                            "no-L6 ablation changed uncertainty routing"
+                        )
+                self._update_sphere_metrics(
+                    no_l6_outputs["saliency"],
+                    device_batch,
+                    valid_lengths,
+                    ablation_metric_totals,
+                    ablation_metric_frames,
                 )
             if not self.args.metrics_only:
                 self._save_predictions(batch, predictions)
@@ -491,11 +563,25 @@ class InferenceRunner:
                     f"L1={area_results['level_l1']:.6f}",
                     f"L2={area_results['level_l2']:.6f}",
                 )
+        ablation_results = {}
+        if self.args.uahs_evaluation_ablations:
+            no_l6_results = self._mean_metrics(
+                ablation_metric_totals, ablation_metric_frames
+            )
+            ablation_results["no_l6_residual"] = no_l6_results
+            print(
+                "no_l6_residual metrics:",
+                " ".join(
+                    f"{name}={value:.6f}"
+                    for name, value in no_l6_results.items()
+                ),
+            )
         if self.uahs_diagnostics is not None:
             self._write_uahs_diagnostics(
                 results,
                 comparison_results,
                 comparison_area_results,
+                ablation_results,
             )
         return results
 
@@ -534,10 +620,16 @@ def main():
         help="collect UAHS uncertainty, selector, hierarchy, and efficiency statistics",
     )
     parser.add_argument(
+        "--uahs_evaluation_ablations",
+        action="store_true",
+        help=(
+            "evaluate no-L6 residual with the same uncertainty routing and final head"
+        ),
+    )
+    parser.add_argument(
         "--selector_comparison_modes",
         nargs="+",
         choices=(
-            "uncertainty_only",
             "saliency_score",
             "random_same_budget",
             "oracle_error_same_budget",
@@ -558,6 +650,8 @@ def main():
     )
     args = parser.parse_args()
     if args.selector_comparison_modes:
+        args.uahs_diagnostics = True
+    if args.uahs_evaluation_ablations:
         args.uahs_diagnostics = True
     args.task = "salient"
     args.test = True
@@ -607,14 +701,23 @@ if __name__ == "__main__":
 CUDA_VISIBLE_DEVICES=3 python /home/dyz/PythonProject/Test_Codes/Sampling_test/inference.py \
     --model_type uahs \
     --dataset_name Sports-360 \
-    --base_model_weights /home/dyz/PythonProject/Test_Codes/Sampling_test/log/models/Epoch_14model.pth \
+    --base_model_weights /path/to/uncertainty_only_uahs.pth \
     --output_dir /home/dyz/PythonProject/DataSet_Output/Sports-360 \
     --method_name UAHS \
     --uahs_diagnostics \
-    --selector_comparison_modes uncertainty_only saliency_score random_same_budget oracle_error_same_budget \
+    --uahs_evaluation_ablations \
+    --selector_comparison_modes saliency_score random_same_budget oracle_error_same_budget \
     --diagnostics_output /home/dyz/PythonProject/Test_Codes/Sampling_test/log/uahs_diagnostics.json \
+    --mode vertex \
+    --img_rank 6 \
     --seq_length 12 \
-    --temporal_window_radius 5 \
+    --temporal_window_radius none \
+    --coarse_pool_type mean_max \
+    --target_refine_ratio_l1 0.25 \
+    --target_refine_ratio_l2 0.125 \
+    --global_query_chunk_size 128 \
+    --hard_selection_warmup_epochs 0 \
     --val_batch_size 1 \
     --num_workers 8
+
 """

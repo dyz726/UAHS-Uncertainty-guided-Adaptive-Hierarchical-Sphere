@@ -53,10 +53,8 @@ class StageProfiler:
             "rank4_local_motion_encoder": model.coarse_local_encoder,
             "rank4_global_content_block": model.coarse_global_block,
             "rank4_uncertainty": model.uncertainty_head_l4,
-            "rank4_refinement": model.refinement_head_l4,
             "rank5_sparse_refiner": model.sparse_refiner_l5,
             "rank5_uncertainty": model.uncertainty_head_l5,
-            "rank5_refinement": model.refinement_head_l5,
             "rank6_sparse_refiner": model.sparse_refiner_l6,
             "final_saliency_head": model.output_proj,
         }
@@ -88,7 +86,7 @@ def formal_args(sequence_length):
     args.model_type = "uahs"
     args.img_rank = 6
     args.seq_length = sequence_length
-    args.temporal_window_radius = 5
+    args.temporal_window_radius = None
     args.return_aux = False
     args.debug_uahs = False
     return args
@@ -100,7 +98,6 @@ def loss_helper(model, args):
     trainer.args = args
     trainer.loss_kl_cc = Trainer.loss_kl_cc.__get__(trainer, Trainer)
     trainer.area_weighted_mean = Trainer.area_weighted_mean
-    trainer.area_weighted_masked_mean = Trainer.area_weighted_masked_mean
     return trainer
 
 
@@ -119,8 +116,6 @@ def complete_loss(trainer, target, outputs):
         + args.lambda_saliency_l5 * auxiliary["loss_saliency_l5"]
         + args.lambda_uncertainty_l4 * auxiliary["loss_uncertainty_l4"]
         + args.lambda_uncertainty_l5 * auxiliary["loss_uncertainty_l5"]
-        + args.lambda_refine_l4 * auxiliary["loss_refine_l4"]
-        + args.lambda_refine_l5 * auxiliary["loss_refine_l5"]
     )
     return {"loss_final": loss_final, **auxiliary, "loss_total": total}
 
@@ -163,11 +158,9 @@ def output_report(model, outputs, batch_size, time_steps):
         "saliency": (batch_size, time_steps, model.hierarchy_l5_l6.fine_vertex_count),
         "saliency_l4": (batch_size, time_steps, model.hierarchy_l4_l5.coarse_face_count),
         "uncertainty_l4": (batch_size, time_steps, model.hierarchy_l4_l5.coarse_face_count),
-        "refine_score_l4": (batch_size, time_steps, model.hierarchy_l4_l5.coarse_face_count),
         "hard_face_mask_l4": (batch_size, time_steps, model.hierarchy_l4_l5.coarse_face_count),
         "saliency_l5": (batch_size, time_steps, model.hierarchy_l5_l6.coarse_face_count),
         "uncertainty_l5": (batch_size, time_steps, model.hierarchy_l5_l6.coarse_face_count),
-        "refine_score_l5": (batch_size, time_steps, model.hierarchy_l5_l6.coarse_face_count),
         "hard_face_mask_l5_effective": (
             batch_size, time_steps, model.hierarchy_l5_l6.coarse_face_count
         ),
@@ -184,6 +177,68 @@ def output_report(model, outputs, batch_size, time_steps):
             "finite": bool(torch.isfinite(tensor.float()).all()),
         }
     return report
+
+
+def hierarchy_report(model):
+    """Verify the exact face subdivision used by both sparse stages."""
+    counts_l4_l5 = torch.bincount(
+        model.hierarchy_l4_l5.fine_face_to_coarse_face.cpu(),
+        minlength=model.hierarchy_l4_l5.coarse_face_count,
+    )
+    counts_l5_l6 = torch.bincount(
+        model.hierarchy_l5_l6.fine_face_to_coarse_face.cpu(),
+        minlength=model.hierarchy_l5_l6.coarse_face_count,
+    )
+    counts_l4_l6 = torch.bincount(
+        model.hierarchy_l4_l6.fine_face_to_coarse_face.cpu(),
+        minlength=model.hierarchy_l4_l6.coarse_face_count,
+    )
+    return {
+        "l4_to_l5_exactly_4": bool((counts_l4_l5 == 4).all()),
+        "l5_to_l6_exactly_4": bool((counts_l5_l6 == 4).all()),
+        "l4_to_l6_exactly_16": bool((counts_l4_l6 == 16).all()),
+        "coverage_l4_l5": int(counts_l4_l5.sum()),
+        "coverage_l5_l6": int(counts_l5_l6.sum()),
+        "coverage_l4_l6": int(counts_l4_l6.sum()),
+    }
+
+
+def routing_report(model, outputs):
+    eligible_l5 = model.hierarchy_l4_l5.propagate_coarse_face_values(
+        outputs["hard_face_mask_l4"]
+    ).bool()
+    selected_l5 = outputs["hard_face_mask_l5_effective"].bool()
+    tolerance_l1 = float(
+        model.hierarchy_l4_l5.coarse_face_areas.max()
+        / model.hierarchy_l4_l5.coarse_face_areas.sum()
+    ) + 1e-6
+    tolerance_l2 = float(
+        model.hierarchy_l5_l6.coarse_face_areas.max()
+        / model.hierarchy_l5_l6.coarse_face_areas.sum()
+    ) + 1e-6
+    queries_l5 = int(outputs["selected_spatial_queries_l5"].sum())
+    queries_l6 = int(outputs["selected_spatial_queries_l6"].sum())
+    dense_l5 = int(outputs["dense_spatial_queries_l5"].sum())
+    dense_l6 = int(outputs["dense_spatial_queries_l6"].sum())
+    return {
+        "parent_constraint": not bool((selected_l5 & ~eligible_l5).any()),
+        "area_budget_l1": bool((
+            (outputs["selected_area_l1"] - model.target_refine_ratio_l1).abs()
+            <= tolerance_l1
+        ).all()),
+        "area_budget_l2": bool((
+            (outputs["selected_area_l2"] - model.target_refine_ratio_l2).abs()
+            <= tolerance_l2
+        ).all()),
+        "l5_selected_queries_only": (
+            0 < queries_l5 < dense_l5
+            and model.sparse_refiner_l5.attention.last_query_count == queries_l5
+        ),
+        "l6_selected_queries_only": (
+            0 < queries_l6 < dense_l6
+            and model.sparse_refiner_l6.attention.last_query_count == queries_l6
+        ),
+    }
 
 
 def run_preflight(sequence_length=12, iterations=3):
@@ -223,6 +278,11 @@ def run_preflight(sequence_length=12, iterations=3):
             "parameters": sum(parameter.numel() for parameter in model.parameters()),
         },
         "memory_before": memory_snapshot(device),
+        "hierarchy": hierarchy_report(model),
+        "refinement_heads_absent": not any(
+            "refinement_head" in name or "refine_" in name
+            for name, _parameter in model.named_parameters()
+        ),
         "iterations": [],
     }
     try:
@@ -259,8 +319,8 @@ def run_preflight(sequence_length=12, iterations=3):
                     "sparse_refiner_l6": model.sparse_refiner_l6,
                     "uncertainty_head_l4": model.uncertainty_head_l4,
                     "uncertainty_head_l5": model.uncertainty_head_l5,
-                    "refinement_head_l4": model.refinement_head_l4,
-                    "refinement_head_l5": model.refinement_head_l5,
+                    "saliency_head_l4": model.saliency_head_l4,
+                    "saliency_head_l5": model.saliency_head_l5,
                     "final_saliency_head": model.output_proj,
                 }.items()
             }
@@ -290,8 +350,6 @@ def run_preflight(sequence_length=12, iterations=3):
                 ),
                 "uncertainty_l4": tensor_statistics(outputs["uncertainty_l4"]),
                 "uncertainty_l5": tensor_statistics(outputs["uncertainty_l5"]),
-                "refine_score_l4": tensor_statistics(outputs["refine_score_l4"]),
-                "refine_score_l5": tensor_statistics(outputs["refine_score_l5"]),
                 "temporal_mask_iou_l4": temporal_mask_iou(
                     outputs["hard_face_mask_l4"]
                 ),
@@ -337,6 +395,7 @@ def run_preflight(sequence_length=12, iterations=3):
                     outputs["estimated_dense_attention_flops_l6"].sum()
                 ),
                 "gradients": gradients,
+                "routing": routing_report(model, outputs),
             }
             if iteration == 0:
                 iteration_report["outputs"] = output_report(
@@ -372,13 +431,26 @@ def run_preflight(sequence_length=12, iterations=3):
         }
         del inference_output
         report["stage_memory_events"] = profiler.events
-        report["pass"] = all(
-            iteration["all_losses_finite"]
+        hierarchy_ok = all(
+            value for key, value in report["hierarchy"].items()
+            if key.endswith(("exactly_4", "exactly_16"))
+        )
+        report["pass"] = (
+            hierarchy_ok
+            and report["refinement_heads_absent"]
             and all(
-                gradient["exists"] and gradient["finite"]
-                for gradient in iteration["gradients"].values()
+                iteration["all_losses_finite"]
+                and all(
+                    output["shape_ok"] and output["finite"]
+                    for output in iteration.get("outputs", {}).values()
+                )
+                and all(iteration["routing"].values())
+                and all(
+                    gradient["exists"] and gradient["finite"]
+                    for gradient in iteration["gradients"].values()
+                )
+                for iteration in report["iterations"]
             )
-            for iteration in report["iterations"]
         )
         return report
     except torch.cuda.OutOfMemoryError as error:
@@ -398,7 +470,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sequence_length", type=int, default=12)
     parser.add_argument("--iterations", type=int, default=3)
-    parser.add_argument("--output", default="log/uahs_v3_preflight.json")
+    parser.add_argument("--output", default="log/uahs_uncertainty_only_preflight.json")
     arguments = parser.parse_args()
     report = run_preflight(arguments.sequence_length, arguments.iterations)
     output_parent = os.path.dirname(os.path.abspath(arguments.output))
