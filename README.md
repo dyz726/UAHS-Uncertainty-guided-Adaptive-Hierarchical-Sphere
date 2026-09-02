@@ -7,7 +7,7 @@ rank-6 spherical saliency map `[B, T, 40962]` through six components:
 1. local motion-aware spherical modeling at rank 4 (two blocks);
 2. true full-sphere, content-aware reasoning at rank 4 (one block);
 3. learned Laplace uncertainty at ranks 4 and 5;
-4. uncertainty-ranked hard spherical-area selection at 25% and 12.5%;
+4. uncertainty-ranked hard spherical-area selection with per-frame dynamic budgets;
 5. selected-query sparse refinement at ranks 5 and 6; and
 6. rank-4/rank-5/rank-6 multi-exit reconstruction.
 
@@ -26,19 +26,22 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
   --dataset_root_dir /path/to/Sports-360 \
   --img_rank 6 --seq_length 12 --temporal_window_radius none \
   --train_batch_size 1 --val_batch_size 1 \
-  --target_refine_ratio_l1 0.25 --target_refine_ratio_l2 0.125
+  --target_refine_ratio_l1 0.25 --target_refine_ratio_l2 0.125 \
+  --budget_l5_min 0.05 --budget_l5_max 0.50
 ```
 
 Use `--model_type sphere_uformer` for the unchanged baseline. Run
 `python train.py --help` for loss weights and optimization options.
 
-The UAHS objective is final saliency loss plus rank-4/rank-5 saliency and
-heteroscedastic Laplace uncertainty losses. The predicted uncertainty directly
-ranks each hard area selector; labels never enter `forward()`.
+The two `target_refine_ratio` values are backward-compatible initialization
+points, not fixed runtime budgets. Error-supervised SmoothL1 losses train small
+budget heads from detached, area-weighted uncertainty statistics. Uncertainty
+still learns primarily from the heteroscedastic Laplace loss and directly ranks
+each hard selector; labels never enter `forward()`.
 
 ## Verification
 
-Run geometry, hard-budget, sparse-equivalence, no-label-leak, gradient, and
+Run geometry, dynamic-budget, sparse-equivalence, no-label-leak, gradient, and
 baseline regression tests:
 
 ```bash
@@ -59,12 +62,10 @@ CUDA_VISIBLE_DEVICES=0 /home/dyz/anaconda3/envs/sphereformer/bin/python \
 python inference.py --model_type uahs \
   --base_model_weights /path/to/uahs.pth \
   --dataset_root_dir /path/to/Sports-360 --metrics_only \
-  --uahs_diagnostics \
-  --selector_comparison_modes saliency_score random_same_budget \
-    oracle_error_same_budget
+  --uahs_diagnostics
 ```
 
 Diagnostics include uncertainty calibration/correlation, selector
 IoU/precision/recall, hierarchical KL, exact selected spherical area, active
-vertices/queries, and estimated refinement work. Oracle error selection is a
-diagnostic reference only and is never used in normal inference.
+vertices/queries, estimated refinement work, and the final uncertainty-routing
+metrics. Inference always evaluates only the formal uncertainty route.

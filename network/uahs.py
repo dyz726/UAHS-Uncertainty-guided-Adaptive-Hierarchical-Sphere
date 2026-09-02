@@ -1,5 +1,6 @@
 """Final Uncertainty-guided Adaptive Hierarchical Sphere architecture."""
 
+import math
 from typing import Optional
 
 import torch
@@ -42,13 +43,81 @@ class HardAreaSelector(nn.Module):
             scores: Tensor,
             face_areas: Tensor,
             eligible_mask: Optional[Tensor] = None,
+            target_ratio: Optional[Tensor] = None,
     ) -> Tensor:
         return build_fixed_area_target(
             scores,
             face_areas,
-            self.target_ratio,
+            self.target_ratio if target_ratio is None else target_ratio,
             eligible_mask=eligible_mask,
         )
+
+
+class DynamicBudgetHead(nn.Module):
+    """Predict a per-frame budget from detached uncertainty statistics."""
+
+    def __init__(
+            self,
+            initial_output: float,
+            output_min: float = 0.0,
+            output_max: float = 1.0,
+            hidden_dim: int = 8,
+    ):
+        super().__init__()
+        if not 0 <= output_min < output_max <= 1:
+            raise ValueError("Expected 0 <= output_min < output_max <= 1")
+        if not output_min <= initial_output <= output_max:
+            raise ValueError("initial_output must be inside the output range")
+        self.output_min = float(output_min)
+        self.output_max = float(output_max)
+        self.initial_output = float(initial_output)
+        self.mlp = nn.Sequential(
+            nn.Linear(2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def reset_output(self):
+        """Start as a constant legacy budget while retaining trainability."""
+        final = self.mlp[-1]
+        nn.init.zeros_(final.weight)
+        normalized = (
+            (self.initial_output - self.output_min)
+            / (self.output_max - self.output_min)
+        )
+        normalized = min(max(normalized, 1e-4), 1 - 1e-4)
+        nn.init.constant_(final.bias, math.log(normalized / (1 - normalized)))
+
+    def forward(
+            self,
+            uncertainty: Tensor,
+            face_areas: Tensor,
+            eligible_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        if uncertainty.shape[-1] != face_areas.numel():
+            raise ValueError("uncertainty and face_areas have different counts")
+        # Budget supervision must never reshape the uncertainty representation.
+        uncertainty = uncertainty.detach()
+        areas = face_areas.to(
+            device=uncertainty.device, dtype=uncertainty.dtype
+        )
+        weights = areas.reshape(*([1] * (uncertainty.ndim - 1)), -1)
+        if eligible_mask is not None:
+            if eligible_mask.shape != uncertainty.shape:
+                raise ValueError("eligible_mask must match uncertainty")
+            weights = weights * eligible_mask.detach().to(weights.dtype)
+        denominator = weights.sum(dim=-1).clamp_min(
+            torch.finfo(uncertainty.dtype).eps
+        )
+        mean = (uncertainty * weights).sum(dim=-1) / denominator
+        variance = (
+            (uncertainty - mean.unsqueeze(-1)).square() * weights
+        ).sum(dim=-1) / denominator
+        statistics = torch.stack((mean, variance.clamp_min(0).sqrt()), dim=-1)
+        unit_budget = torch.sigmoid(self.mlp(statistics).squeeze(-1))
+        return self.output_min + (
+            self.output_max - self.output_min
+        ) * unit_budget
 
 
 class UAHS(nn.Module):
@@ -98,6 +167,8 @@ class UAHS(nn.Module):
             coarse_pool_type: str = "mean_max",
             target_refine_ratio_l1: float = 0.25,
             target_refine_ratio_l2: float = 0.125,
+            budget_l5_min: float = 0.05,
+            budget_l5_max: float = 0.50,
             global_query_chunk_size: int = 128,
             hard_selection_warmup_epochs: int = 0,
             return_aux: bool = False,
@@ -113,6 +184,12 @@ class UAHS(nn.Module):
             raise ValueError("embed_dim must be divisible by num_heads")
         if not 0 <= target_refine_ratio_l2 <= target_refine_ratio_l1 <= 1:
             raise ValueError("Expected 0 <= L2 budget <= L1 budget <= 1")
+        if not 0 <= budget_l5_min < budget_l5_max <= 1:
+            raise ValueError("Expected 0 <= budget_l5_min < budget_l5_max <= 1")
+        if not budget_l5_min <= target_refine_ratio_l1 <= budget_l5_max:
+            raise ValueError("Initial L5 budget must be inside its output range")
+        if target_refine_ratio_l1 <= 0:
+            raise ValueError("Initial L5 budget must be positive")
         if hard_selection_warmup_epochs < 0:
             raise ValueError("hard_selection_warmup_epochs must be non-negative")
 
@@ -124,6 +201,8 @@ class UAHS(nn.Module):
         self.out_channels = out_channels
         self.target_refine_ratio_l1 = float(target_refine_ratio_l1)
         self.target_refine_ratio_l2 = float(target_refine_ratio_l2)
+        self.budget_l5_min = float(budget_l5_min)
+        self.budget_l5_max = float(budget_l5_max)
         self.hard_selection_warmup_epochs = hard_selection_warmup_epochs
         self.current_epoch = 0
         self.return_aux = return_aux
@@ -240,6 +319,14 @@ class UAHS(nn.Module):
         self.saliency_head_l5 = nn.Linear(embed_dim, out_channels)
         self.uncertainty_head_l4 = SphericalUncertaintyHead(embed_dim)
         self.uncertainty_head_l5 = SphericalUncertaintyHead(embed_dim)
+        self.budget_head_l4 = DynamicBudgetHead(
+            initial_output=target_refine_ratio_l1,
+            output_min=budget_l5_min,
+            output_max=budget_l5_max,
+        )
+        self.budget_head_l5 = DynamicBudgetHead(
+            initial_output=target_refine_ratio_l2 / target_refine_ratio_l1,
+        )
         self.hard_selector_l4 = HardAreaSelector(target_refine_ratio_l1)
         self.hard_selector_l5 = HardAreaSelector(target_refine_ratio_l2)
         self.fusion_norm_l5 = norm_layer(embed_dim)
@@ -247,6 +334,10 @@ class UAHS(nn.Module):
         self.output_proj = OutputProj(embed_dim, out_channels)
         self.final_sigmoid = nn.Sigmoid()
         self.apply(self._init_weights)
+        # ``apply`` initializes every Linear first; restore legacy budget biases
+        # last so old and freshly initialized models start at 0.25 / 0.125.
+        self.budget_head_l4.reset_output()
+        self.budget_head_l5.reset_output()
 
     def set_epoch(self, epoch: int):
         self.current_epoch = int(epoch)
@@ -423,6 +514,9 @@ class UAHS(nn.Module):
             self.saliency_head_l4(face_l4).squeeze(-1)
         )
         uncertainty_l4 = self.uncertainty_head_l4(face_l4)
+        budget_l5_pred = self.budget_head_l4(
+            uncertainty_l4, self.hierarchy_l4_l5.coarse_face_areas
+        )
         score_l4 = self._selection_scores(
             selector_mode,
             uncertainty_l4,
@@ -430,7 +524,9 @@ class UAHS(nn.Module):
             selector_seed,
         )
         hard_l4 = self.hard_selector_l4(
-            score_l4, self.hierarchy_l4_l5.coarse_face_areas
+            score_l4,
+            self.hierarchy_l4_l5.coarse_face_areas,
+            target_ratio=budget_l5_pred,
         )
         if hard_mask_overrides and "l4" in hard_mask_overrides:
             hard_l4 = self._validate_override(
@@ -478,6 +574,12 @@ class UAHS(nn.Module):
         )
         uncertainty_l5 = self.uncertainty_head_l5(face_l5)
         eligible_l5 = child_faces_l5.bool()
+        budget_l6_alpha = self.budget_head_l5(
+            uncertainty_l5,
+            self.hierarchy_l5_l6.coarse_face_areas,
+            eligible_mask=eligible_l5,
+        )
+        budget_l6_pred = budget_l5_pred * budget_l6_alpha
         score_l5 = self._selection_scores(
             selector_mode,
             uncertainty_l5,
@@ -488,6 +590,7 @@ class UAHS(nn.Module):
             score_l5,
             self.hierarchy_l5_l6.coarse_face_areas,
             eligible_mask=eligible_l5,
+            target_ratio=budget_l6_pred,
         )
         if hard_mask_overrides and "l5" in hard_mask_overrides:
             hard_l5_local = self._validate_override(
@@ -592,6 +695,8 @@ class UAHS(nn.Module):
                 f"ranks={self.coarse_rank}->{self.middle_rank}->{self.fine_rank}",
                 f"area={selected_area_l1.mean().item():.4f}/"
                 f"{selected_area_l2.mean().item():.4f}",
+                f"budget={budget_l5_pred.mean().item():.4f}/"
+                f"{budget_l6_pred.mean().item():.4f}",
                 f"vertex_ratio={selected_vertex_ratio_l5.mean().item():.4f}/"
                 f"{selected_vertex_ratio_l6.mean().item():.4f}",
                 f"queries={int(query_count_l5.sum())}/{int(query_count_l6.sum())}",
@@ -604,10 +709,14 @@ class UAHS(nn.Module):
             "saliency": saliency,
             "saliency_l4": saliency_l4,
             "uncertainty_l4": uncertainty_l4,
+            "budget_l5_pred": budget_l5_pred,
             "hard_face_mask_l4": hard_l4,
             "selected_area_l1": selected_area_l1,
             "saliency_l5": saliency_l5,
             "uncertainty_l5": uncertainty_l5,
+            "budget_l6_alpha": budget_l6_alpha,
+            "budget_l6_pred": budget_l6_pred,
+            "eligible_face_mask_l5": eligible_l5,
             "hard_face_mask_l5_local": hard_l5_local,
             "hard_face_mask_l5_effective": hard_l5_effective,
             "selected_area_l2": selected_area_l2,

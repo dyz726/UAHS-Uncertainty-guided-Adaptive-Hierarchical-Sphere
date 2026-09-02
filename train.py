@@ -92,10 +92,18 @@ parser.add_argument(
 )
 parser.add_argument("--target_refine_ratio_l1", type=float, default=0.25)
 parser.add_argument("--target_refine_ratio_l2", type=float, default=0.125)
+parser.add_argument("--budget_l5_min", type=float, default=0.05)
+parser.add_argument("--budget_l5_max", type=float, default=0.50)
+parser.add_argument("--budget_error_threshold_l4", type=float, default=0.05)
+parser.add_argument("--budget_error_threshold_l5", type=float, default=0.05)
+parser.add_argument("--budget_error_temperature_l4", type=float, default=0.02)
+parser.add_argument("--budget_error_temperature_l5", type=float, default=0.02)
 parser.add_argument("--lambda_saliency_l4", type=float, default=0.15)
 parser.add_argument("--lambda_saliency_l5", type=float, default=0.15)
 parser.add_argument("--lambda_uncertainty_l4", type=float, default=0.05)
 parser.add_argument("--lambda_uncertainty_l5", type=float, default=0.05)
+parser.add_argument("--lambda_budget_l5", type=float, default=1.0)
+parser.add_argument("--lambda_budget_l6", type=float, default=1.0)
 parser.add_argument("--global_query_chunk_size", type=int, default=128)
 parser.add_argument("--hard_selection_warmup_epochs", type=int, default=0)
 parser.add_argument("--return_aux", action="store_true")
@@ -149,14 +157,6 @@ parser.add_argument(
 )
 
                             
-parser.add_argument("--disable_color_augmentation",  dest="color_augmentation", action="store_false",
-                    help="if set, do not use color augmentation")
-parser.add_argument("--disable_lr_flip_augmentation", dest="lr_flip_augmentation", action="store_false",
-                    help="if set, do not use left-right flipping augmentation")
-parser.add_argument("--disable_yaw_rotation_augmentation", dest="yaw_rotation_augmentation", action="store_false",
-                    help="if set, do not use yaw rotation augmentation")
-
-                
 parser.add_argument("--exp_name", default="train_sphereuformer", type=str)
 parser.add_argument("--log_dir", default="log",type=str, help="models directory")
 parser.add_argument("--wandb_entity", type=str)
@@ -204,19 +204,16 @@ if __name__ == "__main__":
     --img_rank 6 \
     --seq_length 12 \
     --temporal_window_radius none \
+    --rel_pos_init_variance 0 \
     --coarse_pool_type mean_max \
+    --hard_selection_warmup_epochs 0 \
     --target_refine_ratio_l1 0.25 \
     --target_refine_ratio_l2 0.125 \
     --global_query_chunk_size 128 \
-    --hard_selection_warmup_epochs 0 \
-    --lambda_saliency_l4 0.15 \
-    --lambda_saliency_l5 0.15 \
-    --lambda_uncertainty_l4 0.05 \
-    --lambda_uncertainty_l5 0.05 \
     --train_batch_size 1 \
     --val_batch_size 1 \
     --num_workers 8 \
-    --num_epochs 100 \
+    --num_epochs 60 \
     --optimizer adamw \
     --learning_rate 1e-4 \
     --min_learning_rate 1e-6 \
@@ -228,4 +225,5 @@ if __name__ == "__main__":
     --exp_name uahs-v3-sports360 \
     --log_dir /home/dyz/PythonProject/Test_Codes/Sampling_test/log/uahs-v3-sports360 \
     --tensorboard_log_dir /home/dyz/PythonProject/log/tensorboard/uahs
+
 """

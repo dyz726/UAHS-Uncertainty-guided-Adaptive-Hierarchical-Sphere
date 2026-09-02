@@ -7,16 +7,41 @@ import tqdm
 import wandb              
 import numpy as np
 import cv2
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
+from adaptive_objectives import build_error_supervised_budget
 from data.get_saliency_dataloaders import get_dataloaders         
 from network.sphere_model import build_saliency_model
 from Sphere_SalientScore_torch import *
 from trimesh_utils import *
 EPS = 2.2204e-16
+BUDGET_LOG_NAMES = (
+    "budget_l5_pred",
+    "budget_l5_target",
+    "budget_l6_pred",
+    "budget_l6_target",
+    "budget_l5_selected_area",
+    "budget_l6_selected_area",
+    "budget_loss",
+)
 class Trainer:
     def __init__(self, args):
         self.args = args
+        # Preserve programmatic callers that construct an older argument
+        # namespace instead of using the current train.py parser.
+        for name, default in {
+                "budget_l5_min": 0.05,
+                "budget_l5_max": 0.50,
+                "budget_error_threshold_l4": 0.05,
+                "budget_error_threshold_l5": 0.05,
+                "budget_error_temperature_l4": 0.02,
+                "budget_error_temperature_l5": 0.02,
+                "lambda_budget_l5": 1.0,
+                "lambda_budget_l6": 1.0,
+        }.items():
+            if not hasattr(args, name):
+                setattr(args, name, default)
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() and args.use_gpu else "cpu"
         )
@@ -35,12 +60,20 @@ class Trainer:
             coarse_pool_type=getattr(args, "coarse_pool_type", "mean_max"),
             target_refine_ratio_l1=args.target_refine_ratio_l1,
             target_refine_ratio_l2=args.target_refine_ratio_l2,
+            budget_l5_min=args.budget_l5_min,
+            budget_l5_max=args.budget_l5_max,
+            budget_error_threshold_l4=args.budget_error_threshold_l4,
+            budget_error_threshold_l5=args.budget_error_threshold_l5,
+            budget_error_temperature_l4=args.budget_error_temperature_l4,
+            budget_error_temperature_l5=args.budget_error_temperature_l5,
             global_query_chunk_size=args.global_query_chunk_size,
             hard_selection_warmup_epochs=args.hard_selection_warmup_epochs,
             lambda_saliency_l4=args.lambda_saliency_l4,
             lambda_saliency_l5=args.lambda_saliency_l5,
             lambda_uncertainty_l4=args.lambda_uncertainty_l4,
             lambda_uncertainty_l5=args.lambda_uncertainty_l5,
+            lambda_budget_l5=args.lambda_budget_l5,
+            lambda_budget_l6=args.lambda_budget_l6,
         )
 
                     
@@ -74,11 +107,6 @@ class Trainer:
                 "sphere_node_type": self.config["node_type"],
                 "seq_length": args.seq_length
             },
-            augmentation_kwargs=dict(
-                color_augmentation=False,
-                lr_flip_augmentation=False,
-                yaw_rotation_augmentation=False,
-            ),
             train_batch_size=args.train_batch_size,
             val_batch_size=args.val_batch_size,
             num_workers=args.num_workers,
@@ -128,11 +156,22 @@ class Trainer:
                 "Expected 0 <= target_refine_ratio_l2 <= "
                 "target_refine_ratio_l1 <= 1"
             )
+        if not 0 <= args.budget_l5_min < args.budget_l5_max <= 1:
+            raise ValueError("Expected 0 <= budget_l5_min < budget_l5_max <= 1")
+        if not args.budget_l5_min <= target_ratio_l1 <= args.budget_l5_max:
+            raise ValueError("Initial L5 budget must be inside its output range")
+        if min(
+                args.budget_error_temperature_l4,
+                args.budget_error_temperature_l5,
+        ) <= 0:
+            raise ValueError("Budget error temperatures must be positive")
         loss_weights = (
             args.lambda_saliency_l4,
             args.lambda_saliency_l5,
             args.lambda_uncertainty_l4,
             args.lambda_uncertainty_l5,
+            args.lambda_budget_l5,
+            args.lambda_budget_l6,
         )
         if min(loss_weights) < 0:
             raise ValueError("UAHS loss weights must be non-negative")
@@ -265,6 +304,7 @@ class Trainer:
         if "state_dict" in pretrained_dict:
             pretrained_dict = pretrained_dict["state_dict"]
         source_parameter_count = len(pretrained_dict)
+        source_keys = set(pretrained_dict)
         model_dict = model.state_dict()
 
                     
@@ -276,6 +316,11 @@ class Trainer:
             f"Loaded {len(match_keys)}/{len(model_dict)} model tensors "
             f"from {source_parameter_count} tensors in {pretrained_path}"
         )
+        if not any(key.startswith("budget_head_") for key in source_keys):
+            print(
+                "Checkpoint predates dynamic budgets; budget heads retain "
+                "their safe 0.25 / 0.125 initialization."
+            )
 
                  
         model_dict.update(pretrained_dict)
@@ -470,7 +515,7 @@ class Trainer:
             if self.writer:
                 self.writer.close()
 
-    def loss_kl_cc(self, pre_sal, gt_sal,gt_fix):
+    def loss_kl(self, pre_sal, gt_sal,gt_fix):
                     
                     
                      
@@ -496,18 +541,18 @@ class Trainer:
         return (values * weights.reshape(1, 1, -1)).sum(dim=-1).mean()
 
     def compute_uahs_losses(self, ground_truth, outputs):
-        """Supervise saliency and predictive uncertainty; labels stay in loss."""
+        """Supervise saliency, uncertainty, and detached-U dynamic budgets."""
         B, T = ground_truth.shape[:2]
         target_l4 = self.model.aggregate_img_values_to_l4_faces(ground_truth)
         target_l5 = self.model.aggregate_img_values_to_l5_faces(ground_truth)
         saliency_l4 = outputs["saliency_l4"]
         saliency_l5 = outputs["saliency_l5"]
-        loss_saliency_l4 = self.loss_kl_cc(
+        loss_saliency_l4 = self.loss_kl(
             saliency_l4.reshape(B * T, -1),
             target_l4.reshape(B * T, -1),
             gt_fix=None,
         ) / (B * T)
-        loss_saliency_l5 = self.loss_kl_cc(
+        loss_saliency_l5 = self.loss_kl(
             saliency_l5.reshape(B * T, -1),
             target_l5.reshape(B * T, -1),
             gt_fix=None,
@@ -529,11 +574,42 @@ class Trainer:
         loss_uncertainty_l5 = self.area_weighted_mean(
             laplace_l5, self.model.hierarchy_l5_l6.coarse_face_areas
         )
+        budget_l5_target = build_error_supervised_budget(
+            target_l4,
+            saliency_l4,
+            self.model.hierarchy_l4_l5.coarse_face_areas,
+            self.args.budget_error_threshold_l4,
+            self.args.budget_error_temperature_l4,
+        )
+        budget_l6_target = build_error_supervised_budget(
+            target_l5,
+            saliency_l5,
+            self.model.hierarchy_l5_l6.coarse_face_areas,
+            self.args.budget_error_threshold_l5,
+            self.args.budget_error_temperature_l5,
+            eligible_mask=outputs["eligible_face_mask_l5"],
+        )
+        budget_l5_pred = outputs["budget_l5_pred"]
+        budget_l6_pred = outputs["budget_l6_pred"]
+        loss_budget_l5 = F.smooth_l1_loss(
+            budget_l5_pred, budget_l5_target
+        )
+        loss_budget_l6 = F.smooth_l1_loss(
+            budget_l6_pred, budget_l6_target
+        )
         return {
             "loss_saliency_l4": loss_saliency_l4,
             "loss_saliency_l5": loss_saliency_l5,
             "loss_uncertainty_l4": loss_uncertainty_l4,
             "loss_uncertainty_l5": loss_uncertainty_l5,
+            "loss_budget_l5": loss_budget_l5,
+            "loss_budget_l6": loss_budget_l6,
+            "budget_l5_pred": budget_l5_pred.mean(),
+            "budget_l5_target": budget_l5_target.mean(),
+            "budget_l6_pred": budget_l6_pred.mean(),
+            "budget_l6_target": budget_l6_target.mean(),
+            "budget_l5_selected_area": outputs["selected_area_l1"].mean(),
+            "budget_l6_selected_area": outputs["selected_area_l2"].mean(),
         }
 
     def train_one_epoch(self):
@@ -546,11 +622,15 @@ class Trainer:
         pbar.set_description(f"## {self.args.exp_name} ## Training Epoch_{self.epoch}")
         loss_sum = []
         sal_metrics = {'AUC': [], 'NSS': [], 'CC': [], 'SIM': [], 'KL': []}
+        budget_metrics = {name: [] for name in BUDGET_LOG_NAMES}
         for batch_idx, inputs in enumerate(pbar, start=1):
             self.mini_step += 1
             inputs_ = self.inputs_to_device(inputs)
             outputs, losses = self.process_batch(inputs_,inputs["videoID"])
             loss_sum.append(losses["loss"].item())
+            for name in BUDGET_LOG_NAMES:
+                if name in outputs:
+                    budget_metrics[name].append(float(outputs[name].item()))
 
             group_start = ((batch_idx - 1) // self.args.accum_grads) * self.args.accum_grads
             group_size = min(
@@ -592,8 +672,15 @@ class Trainer:
             for name, values in sal_metrics.items()
             if values
         }
+        train_budget_metrics = {
+            name: sum(values) / len(values)
+            for name, values in budget_metrics.items()
+            if values
+        }
         print("Train Mean Loss:", train_loss)
         print("Train Metrics:", train_metrics)
+        if train_budget_metrics:
+            print("Train Dynamic Budgets:", train_budget_metrics)
 
         if self.writer:
             self.writer.add_scalar("train/loss", train_loss, self.epoch)
@@ -601,6 +688,8 @@ class Trainer:
                 "train/learning_rate", self.optimizer.param_groups[0]["lr"], self.epoch
             )
             for name, value in train_metrics.items():
+                self.writer.add_scalar(f"train/{name}", value, self.epoch)
+            for name, value in train_budget_metrics.items():
                 self.writer.add_scalar(f"train/{name}", value, self.epoch)
             self.writer.flush()
 
@@ -610,6 +699,10 @@ class Trainer:
                     "train/loss": train_loss,
                     "train/learning_rate": self.optimizer.param_groups[0]["lr"],
                     **{f"train/{name}": value for name, value in train_metrics.items()},
+                    **{
+                        f"train/{name}": value
+                        for name, value in train_budget_metrics.items()
+                    },
                 },
                 step=self.epoch,
                 commit=False,
@@ -624,12 +717,16 @@ class Trainer:
         pbar.set_description(f"Validating Epoch_{self.epoch}")
         loss_sum = []
         sal_metrics = {'AUC': [], 'NSS': [], 'CC': [], 'SIM': [], 'KL': []}
+        budget_metrics = {name: [] for name in BUDGET_LOG_NAMES}
         with torch.no_grad():
             for batch_idx, inputs in enumerate(pbar):
                 inputs_ = self.inputs_to_device(inputs)
                 outputs, losses = self.process_batch(inputs_,inputs["videoID"])
 
                 loss_sum.append(losses["loss"].item())
+                for name in BUDGET_LOG_NAMES:
+                    if name in outputs:
+                        budget_metrics[name].append(float(outputs[name].item()))
                                
                 pred_sal = outputs["pred_sal"]                      
                 gt_sal = inputs_["normalized_sphere_sal"]                      
@@ -647,12 +744,21 @@ class Trainer:
             for name, values in sal_metrics.items()
             if values
         }
+        val_budget_metrics = {
+            name: sum(values) / len(values)
+            for name, values in budget_metrics.items()
+            if values
+        }
         print("Val Mean Loss:", current_val_loss)
         print("Val Metrics:", val_metrics)
+        if val_budget_metrics:
+            print("Val Dynamic Budgets:", val_budget_metrics)
 
         if self.writer:
             self.writer.add_scalar("val/loss", current_val_loss, self.epoch)
             for name, value in val_metrics.items():
+                self.writer.add_scalar(f"val/{name}", value, self.epoch)
+            for name, value in val_budget_metrics.items():
                 self.writer.add_scalar(f"val/{name}", value, self.epoch)
             self.writer.flush()
 
@@ -661,6 +767,10 @@ class Trainer:
                 {
                     "val/loss": current_val_loss,
                     **{f"val/{name}": value for name, value in val_metrics.items()},
+                    **{
+                        f"val/{name}": value
+                        for name, value in val_budget_metrics.items()
+                    },
                 },
                 step=self.epoch,
                 commit=True,
@@ -689,7 +799,7 @@ class Trainer:
         gt_fix = gt_fix.reshape(B * T, L)
 
                   
-        loss_rec = self.loss_kl_cc(pre_probs, gt_probs,gt_fix)/(B*T)
+        loss_rec = self.loss_kl(pre_probs, gt_probs,gt_fix)/(B*T)
 
         auxiliary_losses = {}
         total_loss = loss_rec
@@ -705,9 +815,28 @@ class Trainer:
                 * auxiliary_losses["loss_uncertainty_l4"]
                 + self.args.lambda_uncertainty_l5
                 * auxiliary_losses["loss_uncertainty_l5"]
+                + self.args.lambda_budget_l5
+                * auxiliary_losses["loss_budget_l5"]
+                + self.args.lambda_budget_l6
+                * auxiliary_losses["loss_budget_l6"]
             )
 
         outputs = {"pred_sal": pred_sal.detach()}
+        if uahs_outputs is not None:
+            budget_loss = (
+                self.args.lambda_budget_l5 * auxiliary_losses["loss_budget_l5"]
+                + self.args.lambda_budget_l6 * auxiliary_losses["loss_budget_l6"]
+            )
+            for name in (
+                    "budget_l5_pred",
+                    "budget_l5_target",
+                    "budget_l6_pred",
+                    "budget_l6_target",
+                    "budget_l5_selected_area",
+                    "budget_l6_selected_area",
+            ):
+                outputs[name] = auxiliary_losses[name].detach()
+            outputs["budget_loss"] = budget_loss.detach()
         losses = {
             "loss": total_loss,
             "loss_saliency": loss_rec,

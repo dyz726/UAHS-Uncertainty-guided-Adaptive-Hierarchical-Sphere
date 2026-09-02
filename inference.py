@@ -12,7 +12,6 @@ if EVALUATE_DIR not in sys.path:
     sys.path.insert(0, EVALUATE_DIR)
 
 from adaptive_diagnostics import UAHSDiagnosticsAccumulator
-from adaptive_objectives import build_fixed_area_target
 from data.get_saliency_dataloaders import get_dataloaders
 from evaluation import evaluate_saliency_maps_in_folder
 from network.sphere_model import build_saliency_model
@@ -39,7 +38,6 @@ class InferenceRunner:
                 "sphere_node_type": args.mode,
                 "seq_length": args.seq_length,
             },
-            augmentation_kwargs={},
             train_batch_size=args.train_batch_size,
             val_batch_size=args.val_batch_size,
             num_workers=args.num_workers,
@@ -52,15 +50,8 @@ class InferenceRunner:
         self.model = build_saliency_model(args)
         self._load_weights(args.base_model_weights)
         self.model.to(self.device).eval()
-        comparison_modes = getattr(args, "selector_comparison_modes", None) or []
         if args.uahs_diagnostics and args.model_type != "uahs":
             raise ValueError("--uahs_diagnostics requires --model_type uahs")
-        if comparison_modes and args.model_type != "uahs":
-            raise ValueError("selector comparisons require --model_type uahs")
-        if args.uahs_evaluation_ablations and args.model_type != "uahs":
-            raise ValueError(
-                "--uahs_evaluation_ablations requires --model_type uahs"
-            )
         if args.model_type == "uahs" and not (
                 0 <= args.target_refine_ratio_l2
                 <= args.target_refine_ratio_l1 <= 1
@@ -76,7 +67,6 @@ class InferenceRunner:
             )
         else:
             self.uahs_diagnostics = None
-        self.comparison_modes = list(dict.fromkeys(comparison_modes))
 
         sphere_ref = IcoSphereRef(args.mode)
         spherical = asSpherical(sphere_ref.get_normals(rank=args.img_rank))
@@ -102,12 +92,27 @@ class InferenceRunner:
             for key, value in state_dict.items()
         }
         try:
-            self.model.load_state_dict(state_dict, strict=True)
+            incompatible = self.model.load_state_dict(state_dict, strict=False)
         except RuntimeError as error:
             raise RuntimeError(
-                "Checkpoint does not exactly match the selected final model. "
-                "Legacy adaptive checkpoints are intentionally unsupported."
+                "Checkpoint tensors do not match the selected model."
             ) from error
+        allowed_missing_prefixes = ("budget_head_l4.", "budget_head_l5.")
+        disallowed_missing = [
+            key for key in incompatible.missing_keys
+            if not key.startswith(allowed_missing_prefixes)
+        ]
+        if disallowed_missing or incompatible.unexpected_keys:
+            raise RuntimeError(
+                "Checkpoint does not match the selected model: "
+                f"missing={disallowed_missing}, "
+                f"unexpected={incompatible.unexpected_keys}"
+            )
+        if incompatible.missing_keys:
+            print(
+                "Checkpoint predates dynamic budgets; initialized budget heads "
+                "at the legacy 0.25 / 0.125 operating point."
+            )
         print(f"Loaded {len(state_dict)} model tensors from {path}")
 
     def _to_device(self, batch):
@@ -263,43 +268,9 @@ class InferenceRunner:
             if metric_frames[name]
         }
 
-    def _build_oracle_masks(
-            self,
-            uahs_outputs,
-            ground_truth,
-            rgb,
-    ):
-        target_l4 = self.model.aggregate_img_values_to_l4_faces(ground_truth)
-        selection_l4 = build_fixed_area_target(
-            (target_l4 - uahs_outputs["saliency_l4"]).abs(),
-            self.model.hierarchy_l4_l5.coarse_face_areas,
-            self.args.target_refine_ratio_l1,
-        )
-        provisional = self.model(
-            rgb,
-            return_aux=True,
-            hard_mask_overrides={"l4": selection_l4},
-        )
-        target_l5 = self.model.aggregate_img_values_to_l5_faces(ground_truth)
-        eligible_l5 = self.model.hierarchy_l4_l5.propagate_coarse_face_values(
-            selection_l4
-        ).bool()
-        selection_l5 = build_fixed_area_target(
-            (target_l5 - provisional["saliency_l5"]).abs(),
-            self.model.hierarchy_l5_l6.coarse_face_areas,
-            self.args.target_refine_ratio_l2,
-            eligible_mask=eligible_l5,
-        )
-        return {"l4": selection_l4, "l5": selection_l5}
-
-    def _write_uahs_diagnostics(
-            self,
-            results,
-            comparison_results,
-            comparison_area_results,
-            ablation_results,
-    ):
+    def _write_uahs_diagnostics(self, results):
         report = self.uahs_diagnostics.summary()
+        report["metrics"] = results
         report["configuration"] = {
             "checkpoint": self.args.base_model_weights,
             "dataset": self.args.dataset_name,
@@ -314,68 +285,19 @@ class InferenceRunner:
             "local_motion_blocks": 2,
             "global_content_blocks": 1,
             "global_query_chunk_size": self.args.global_query_chunk_size,
-            "target_refine_ratio_l1": self.args.target_refine_ratio_l1,
-            "target_refine_ratio_l2": self.args.target_refine_ratio_l2,
+            "initial_budget_l5": self.args.target_refine_ratio_l1,
+            "initial_budget_l6": self.args.target_refine_ratio_l2,
+            "budget_l5_min": self.args.budget_l5_min,
+            "budget_l5_max": self.args.budget_l5_max,
+            "budget_error_threshold_l4": self.args.budget_error_threshold_l4,
+            "budget_error_threshold_l5": self.args.budget_error_threshold_l5,
+            "budget_error_temperature_l4": self.args.budget_error_temperature_l4,
+            "budget_error_temperature_l5": self.args.budget_error_temperature_l5,
             "max_batches": self.args.max_batches,
-            "uahs_evaluation_ablations": self.args.uahs_evaluation_ablations,
             "routing": "uncertainty_only",
         }
         if hasattr(self.model, "middle_rank"):
             report["configuration"]["middle_rank"] = self.model.middle_rank
-        if comparison_results:
-            higher_is_better = {"AUC", "NSS", "CC", "SIM"}
-            report["selector_comparisons"] = {
-                "definitions": {
-                    "saliency_score": "hard area selection ranked by saliency",
-                    "random_same_budget": (
-                        "random hard hierarchy at the same fixed area budgets"
-                    ),
-                    "oracle_error_same_budget": (
-                        "GT-error hard hierarchy; diagnostic, not a theoretical upper bound"
-                    ),
-                },
-                "uncertainty_routing_metrics": results,
-                "baselines": {},
-            }
-            for mode, baseline_results in comparison_results.items():
-                baseline_gain = {
-                    name: (
-                        results[name] - baseline_results[name]
-                        if name in higher_is_better
-                        else baseline_results[name] - results[name]
-                    )
-                    for name in results
-                    if name in baseline_results
-                }
-                report["selector_comparisons"]["baselines"][mode] = {
-                    "metrics": baseline_results,
-                    "actual_area_ratio": comparison_area_results.get(mode),
-                    "uncertainty_routing_gain_positive_is_better": baseline_gain,
-                }
-
-        if self.args.uahs_evaluation_ablations:
-            higher_is_better = {"AUC", "NSS", "CC", "SIM"}
-            no_l6_metrics = ablation_results["no_l6_residual"]
-            l6_gain = {
-                name: (
-                    results[name] - no_l6_metrics[name]
-                    if name in higher_is_better
-                    else no_l6_metrics[name] - results[name]
-                )
-                for name in results
-                if name in no_l6_metrics
-            }
-            report["evaluation_ablations"] = {
-                "no_l6_residual": {
-                    "definition": (
-                        "skip only selected-query rank-6 residual computation; "
-                        "keep uncertainty routing, F5->F6 base reconstruction, fusion "
-                        "normalization, and the same final output head"
-                    ),
-                    "metrics": no_l6_metrics,
-                    "l6_gain_positive_is_better": l6_gain,
-                },
-            }
 
         output_path = self.args.diagnostics_output
         if not output_path:
@@ -395,47 +317,23 @@ class InferenceRunner:
     def run(self):
         metric_totals = {name: 0.0 for name in ("AUC", "NSS", "CC", "SIM", "KL")}
         metric_frames = {name: 0 for name in metric_totals}
-        comparison_metric_totals = {
-            mode: {name: 0.0 for name in metric_totals}
-            for mode in self.comparison_modes
-        }
-        comparison_metric_frames = {
-            mode: {name: 0 for name in metric_totals}
-            for mode in self.comparison_modes
-        }
-        comparison_area_totals = {
-            mode: {"level_l1": 0.0, "level_l2": 0.0, "frames": 0}
-            for mode in self.comparison_modes
-        }
-        ablation_metric_totals = {
-            name: 0.0 for name in metric_totals
-        }
-        ablation_metric_frames = {
-            name: 0 for name in metric_totals
-        }
         progress = tqdm.tqdm(
             self.loader_test, desc=f"{self.args.dataset_name} inference"
         )
         for batch_idx, batch in enumerate(progress):
             device_batch = self._to_device(batch)
             valid_lengths = batch["valid_length"].tolist()
-            need_aux = (
-                self.uahs_diagnostics is not None
-                or self.args.uahs_evaluation_ablations
-                or bool(self.comparison_modes)
-            )
-            if need_aux:
+            if self.uahs_diagnostics is not None:
                 uahs_outputs = self.model(
                     device_batch["normalized_sphere_rgb"], return_aux=True
                 )
                 predictions = uahs_outputs["saliency"]
-                if self.uahs_diagnostics is not None:
-                    self.uahs_diagnostics.update(
-                        uahs_outputs,
-                        device_batch["normalized_sphere_sal"],
-                        valid_lengths,
-                        self.model,
-                    )
+                self.uahs_diagnostics.update(
+                    uahs_outputs,
+                    device_batch["normalized_sphere_sal"],
+                    valid_lengths,
+                    self.model,
+                )
             else:
                 predictions = self.model(device_batch["normalized_sphere_rgb"])
                 if isinstance(predictions, dict):
@@ -447,78 +345,6 @@ class InferenceRunner:
                 metric_totals,
                 metric_frames,
             )
-
-            for mode in self.comparison_modes:
-                if mode == "oracle_error_same_budget":
-                    mask_overrides = self._build_oracle_masks(
-                        uahs_outputs,
-                        device_batch["normalized_sphere_sal"],
-                        device_batch["normalized_sphere_rgb"],
-                    )
-                    comparison_outputs = self.model(
-                        device_batch["normalized_sphere_rgb"],
-                        return_aux=True,
-                        hard_mask_overrides=mask_overrides,
-                    )
-                else:
-                    comparison_outputs = self.model(
-                        device_batch["normalized_sphere_rgb"],
-                        return_aux=True,
-                        selector_mode=mode,
-                        selector_seed=self.args.diagnostic_random_seed + batch_idx,
-                    )
-                comparison_predictions = comparison_outputs["saliency"]
-                for sample_idx, valid_length in enumerate(valid_lengths):
-                    valid_length = int(valid_length)
-                    if valid_length == 0:
-                        continue
-                    comparison_area_totals[mode]["level_l1"] += (
-                        comparison_outputs["selected_area_l1"][
-                            sample_idx, :valid_length
-                        ].sum().item()
-                    )
-                    comparison_area_totals[mode]["level_l2"] += (
-                        comparison_outputs["selected_area_l2"][
-                            sample_idx, :valid_length
-                        ].sum().item()
-                    )
-                    comparison_area_totals[mode]["frames"] += valid_length
-                self._update_sphere_metrics(
-                    comparison_predictions,
-                    device_batch,
-                    valid_lengths,
-                    comparison_metric_totals[mode],
-                    comparison_metric_frames[mode],
-                )
-            if self.args.uahs_evaluation_ablations:
-                no_l6_outputs = self.model(
-                    device_batch["normalized_sphere_rgb"],
-                    return_aux=True,
-                    hard_mask_overrides={
-                        "l4": uahs_outputs["hard_face_mask_l4"],
-                        "l5": uahs_outputs[
-                            "hard_face_mask_l5_effective"
-                        ],
-                    },
-                    disable_l6_refinement=True,
-                )
-                for mask_name in (
-                        "hard_face_mask_l4",
-                        "hard_face_mask_l5_effective",
-                ):
-                    if not torch.equal(
-                            uahs_outputs[mask_name], no_l6_outputs[mask_name]
-                    ):
-                        raise RuntimeError(
-                            "no-L6 ablation changed uncertainty routing"
-                        )
-                self._update_sphere_metrics(
-                    no_l6_outputs["saliency"],
-                    device_batch,
-                    valid_lengths,
-                    ablation_metric_totals,
-                    ablation_metric_frames,
-                )
             if not self.args.metrics_only:
                 self._save_predictions(batch, predictions)
             if self.args.max_batches and batch_idx + 1 >= self.args.max_batches:
@@ -528,61 +354,8 @@ class InferenceRunner:
             self.save_mat_results()
 
         results = self._mean_metrics(metric_totals, metric_frames)
-        print(
-            "Test metrics:",
-            " ".join(f"{name}={value:.6f}" for name, value in results.items()),
-        )
-        comparison_results = {}
-        comparison_area_results = {}
-        for mode in self.comparison_modes:
-            comparison_results[mode] = self._mean_metrics(
-                comparison_metric_totals[mode],
-                comparison_metric_frames[mode],
-            )
-            area_totals = comparison_area_totals[mode]
-            if area_totals["frames"]:
-                comparison_area_results[mode] = {
-                    "level_l1": (
-                        area_totals["level_l1"] / area_totals["frames"]
-                    ),
-                    "level_l2": (
-                        area_totals["level_l2"] / area_totals["frames"]
-                    ),
-                }
-            print(
-                f"{mode} metrics:",
-                " ".join(
-                    f"{name}={value:.6f}"
-                    for name, value in comparison_results[mode].items()
-                ),
-            )
-            if mode in comparison_area_results:
-                area_results = comparison_area_results[mode]
-                print(
-                    f"{mode} actual area:",
-                    f"L1={area_results['level_l1']:.6f}",
-                    f"L2={area_results['level_l2']:.6f}",
-                )
-        ablation_results = {}
-        if self.args.uahs_evaluation_ablations:
-            no_l6_results = self._mean_metrics(
-                ablation_metric_totals, ablation_metric_frames
-            )
-            ablation_results["no_l6_residual"] = no_l6_results
-            print(
-                "no_l6_residual metrics:",
-                " ".join(
-                    f"{name}={value:.6f}"
-                    for name, value in no_l6_results.items()
-                ),
-            )
         if self.uahs_diagnostics is not None:
-            self._write_uahs_diagnostics(
-                results,
-                comparison_results,
-                comparison_area_results,
-                ablation_results,
-            )
+            self._write_uahs_diagnostics(results)
         return results
 
 
@@ -620,39 +393,11 @@ def main():
         help="collect UAHS uncertainty, selector, hierarchy, and efficiency statistics",
     )
     parser.add_argument(
-        "--uahs_evaluation_ablations",
-        action="store_true",
-        help=(
-            "evaluate no-L6 residual with the same uncertainty routing and final head"
-        ),
-    )
-    parser.add_argument(
-        "--selector_comparison_modes",
-        nargs="+",
-        choices=(
-            "saliency_score",
-            "random_same_budget",
-            "oracle_error_same_budget",
-        ),
-        default=None,
-        help="evaluate selected hard-selector baselines at identical area budgets",
-    )
-    parser.add_argument(
-        "--diagnostic_random_seed",
-        type=int,
-        default=0,
-        help="reproducible random_same_budget selection seed",
-    )
-    parser.add_argument(
         "--diagnostics_output",
         default=None,
         help="optional JSON path for UAHS diagnostics",
     )
     args = parser.parse_args()
-    if args.selector_comparison_modes:
-        args.uahs_diagnostics = True
-    if args.uahs_evaluation_ablations:
-        args.uahs_diagnostics = True
     args.task = "salient"
     args.test = True
                                           
@@ -688,7 +433,7 @@ def main():
         except Exception as error:
             print(f"ERP evaluation failed: {error}")
 
-    print("\n========== Sphere Metrics (for comparison) ==========")
+    print("\n========== Final Sphere Metrics ==========")
     for name in ("AUC", "NSS", "CC", "SIM", "KL"):
         if name in sphere_metrics:
             print(f"{name}: {sphere_metrics[name]:.6f}")
@@ -701,13 +446,9 @@ if __name__ == "__main__":
 CUDA_VISIBLE_DEVICES=3 python /home/dyz/PythonProject/Test_Codes/Sampling_test/inference.py \
     --model_type uahs \
     --dataset_name Sports-360 \
-    --base_model_weights /path/to/uncertainty_only_uahs.pth \
+    --base_model_weights /home/dyz/PythonProject/Test_Codes/Sampling_test/log/uahs-v3-sports360/models/Epoch_30model.pth \
     --output_dir /home/dyz/PythonProject/DataSet_Output/Sports-360 \
     --method_name UAHS \
-    --uahs_diagnostics \
-    --uahs_evaluation_ablations \
-    --selector_comparison_modes saliency_score random_same_budget oracle_error_same_budget \
-    --diagnostics_output /home/dyz/PythonProject/Test_Codes/Sampling_test/log/uahs_diagnostics.json \
     --mode vertex \
     --img_rank 6 \
     --seq_length 12 \
@@ -720,4 +461,16 @@ CUDA_VISIBLE_DEVICES=3 python /home/dyz/PythonProject/Test_Codes/Sampling_test/i
     --val_batch_size 1 \
     --num_workers 8
 
+Epoch_30model.pth
+Average AUC-J:  0.9387995677737113
+Average NSS:  4.352345161239625
+Average KL Divergence:  1.6327730351383458
+Average SIM:  0.4899660684485185
+Average CC:  0.670838757243907
+========== Sphere Metrics (for comparison) ==========
+AUC: 0.922776
+NSS: 3.646490
+CC: 0.663930
+SIM: 0.490483
+KL: 0.955341
 """

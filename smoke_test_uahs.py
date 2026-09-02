@@ -5,7 +5,11 @@ from types import SimpleNamespace
 import torch
 
 from adaptive_diagnostics import UAHSDiagnosticsAccumulator
-from adaptive_objectives import build_fixed_area_target, per_frame_spearman
+from adaptive_objectives import (
+    build_error_supervised_budget,
+    build_fixed_area_target,
+    per_frame_spearman,
+)
 from network.sphere_model import build_saliency_model
 from network.sphere_PSA import (
     GlobalSphereSelfAttention,
@@ -48,6 +52,12 @@ def model_args(model_type="uahs", img_rank=3):
         coarse_pool_type="mean_max",
         target_refine_ratio_l1=0.25,
         target_refine_ratio_l2=0.125,
+        budget_l5_min=0.05,
+        budget_l5_max=0.50,
+        budget_error_threshold_l4=0.05,
+        budget_error_threshold_l5=0.05,
+        budget_error_temperature_l4=0.02,
+        budget_error_temperature_l5=0.02,
         global_query_chunk_size=32,
         hard_selection_warmup_epochs=0,
         return_aux=False,
@@ -56,6 +66,8 @@ def model_args(model_type="uahs", img_rank=3):
         lambda_saliency_l5=0.15,
         lambda_uncertainty_l4=0.05,
         lambda_uncertainty_l5=0.05,
+        lambda_budget_l5=1.0,
+        lambda_budget_l6=1.0,
     )
 
 
@@ -121,7 +133,28 @@ def hierarchy_and_budget_test():
     assert bool(((area_l4 - 0.25).abs() <= tolerance_l4).all())
     assert bool(((area_l5 - 0.125).abs() <= tolerance_l5).all())
     assert not bool((mask_l5.bool() & ~parent_l5).any())
-    print("hierarchy 1->4/1->16, hard budgets, and parent constraint: OK")
+    dynamic_mask = build_fixed_area_target(
+        score_l4,
+        l4_l5.coarse_face_areas,
+        torch.tensor([[0.10, 0.35]]),
+    )
+    dynamic_area = (
+        dynamic_mask * l4_l5.coarse_face_areas
+    ).sum(-1) / l4_l5.coarse_face_areas.sum()
+    assert float(dynamic_area[0, 0]) < float(dynamic_area[0, 1])
+    residual_target = build_error_supervised_budget(
+        torch.ones_like(score_l5),
+        torch.zeros_like(score_l5),
+        l5_l6.coarse_face_areas,
+        error_threshold=0.05,
+        error_temperature=0.02,
+        eligible_mask=parent_l5,
+    )
+    eligible_area = (
+        parent_l5 * l5_l6.coarse_face_areas
+    ).sum(-1) / l5_l6.coarse_face_areas.sum()
+    assert bool((residual_target <= eligible_area + 1e-6).all())
+    print("hierarchy, tensor budgets, error oracle, and parent constraint: OK")
 
 
 def sparse_attention_equivalence_test():
@@ -220,6 +253,33 @@ def warmup_randomness_test():
     print("warm-up RNG advances; diagnostic random selector is reproducible: OK")
 
 
+def legacy_budget_checkpoint_test():
+    """Missing dynamic heads must retain the legacy operating point."""
+    source = build_saliency_model(model_args("uahs", img_rank=3))
+    legacy_state = {
+        name: value
+        for name, value in source.state_dict().items()
+        if not name.startswith(("budget_head_l4.", "budget_head_l5."))
+    }
+    restored = build_saliency_model(model_args("uahs", img_rank=3)).eval()
+    incompatible = restored.load_state_dict(legacy_state, strict=False)
+    assert not incompatible.unexpected_keys
+    assert incompatible.missing_keys
+    assert all(
+        name.startswith(("budget_head_l4.", "budget_head_l5."))
+        for name in incompatible.missing_keys
+    )
+    with torch.no_grad():
+        outputs = restored(torch.randn(1, 1, 642, 3), return_aux=True)
+    assert torch.allclose(
+        outputs["budget_l5_pred"], torch.tensor([[0.25]]), atol=1e-6
+    )
+    assert torch.allclose(
+        outputs["budget_l6_pred"], torch.tensor([[0.125]]), atol=1e-6
+    )
+    print("legacy checkpoint dynamic-budget initialization: OK")
+
+
 def sparse_scatter_reconstruction_test():
     torch.manual_seed(29)
     model = build_saliency_model(model_args("uahs", img_rank=3))
@@ -315,10 +375,12 @@ def uahs_training_and_no_gt_leak_test():
             / model.hierarchy_l5_l6.coarse_face_areas.sum()
         )
         assert bool((
-            (selected["selected_area_l1"] - 0.25).abs() <= tolerance_l1
+            (selected["selected_area_l1"] - selected["budget_l5_pred"]).abs()
+            <= tolerance_l1
         ).all())
         assert bool((
-            (selected["selected_area_l2"] - 0.125).abs() <= tolerance_l2
+            (selected["selected_area_l2"] - selected["budget_l6_pred"]).abs()
+            <= tolerance_l2
         ).all())
         eligible = model.hierarchy_l4_l5.propagate_coarse_face_values(
             selected["hard_face_mask_l4"]
@@ -331,9 +393,12 @@ def uahs_training_and_no_gt_leak_test():
         "saliency": (1, 2, 642),
         "saliency_l4": (1, 2, 80),
         "uncertainty_l4": (1, 2, 80),
+        "budget_l5_pred": (1, 2),
         "hard_face_mask_l4": (1, 2, 80),
         "saliency_l5": (1, 2, 320),
         "uncertainty_l5": (1, 2, 320),
+        "budget_l6_alpha": (1, 2),
+        "budget_l6_pred": (1, 2),
         "hard_face_mask_l5_effective": (1, 2, 320),
         "exit_level": (1, 2, 642),
     }
@@ -353,7 +418,7 @@ def uahs_training_and_no_gt_leak_test():
     trainer = Trainer.__new__(Trainer)
     trainer.model = model
     trainer.args = args
-    trainer.loss_kl_cc = Trainer.loss_kl_cc.__get__(trainer, Trainer)
+    trainer.loss_kl = Trainer.loss_kl.__get__(trainer, Trainer)
     trainer.area_weighted_mean = Trainer.area_weighted_mean
     ground_truth_a = torch.rand(1, 2, 642)
     ground_truth_b = torch.rand(1, 2, 642)
@@ -365,12 +430,40 @@ def uahs_training_and_no_gt_leak_test():
         "loss_saliency_l5",
         "loss_uncertainty_l4",
         "loss_uncertainty_l5",
+        "loss_budget_l5",
+        "loss_budget_l6",
+        "budget_l5_pred",
+        "budget_l5_target",
+        "budget_l6_pred",
+        "budget_l6_target",
+        "budget_l5_selected_area",
+        "budget_l6_selected_area",
     }
     assert not torch.equal(losses_a["loss_uncertainty_l4"], losses_b["loss_uncertainty_l4"])
 
     model.train()
     outputs = model(inputs, return_aux=True)
     losses = trainer.compute_uahs_losses(ground_truth_a, outputs)
+    assert torch.allclose(
+        outputs["budget_l5_pred"], torch.full((1, 2), 0.25), atol=1e-6
+    )
+    assert torch.allclose(
+        outputs["budget_l6_pred"], torch.full((1, 2), 0.125), atol=1e-6
+    )
+    assert bool((outputs["budget_l6_pred"] <= outputs["budget_l5_pred"]).all())
+
+    model.zero_grad(set_to_none=True)
+    (losses["loss_budget_l5"] + losses["loss_budget_l6"]).backward(
+        retain_graph=True
+    )
+    assert_gradient("budget L4", model.budget_head_l4)
+    assert_gradient("budget L5", model.budget_head_l5)
+    assert all(
+        parameter.grad is None
+        for module in (model.uncertainty_head_l4, model.uncertainty_head_l5)
+        for parameter in module.parameters()
+    ), "budget loss unexpectedly updated an uncertainty head"
+    model.zero_grad(set_to_none=True)
     total_loss = outputs["saliency"].mean()
     for name, value in losses.items():
         if name.startswith("loss_"):
@@ -384,6 +477,8 @@ def uahs_training_and_no_gt_leak_test():
             ("sparse L6", model.sparse_refiner_l6),
             ("uncertainty L4", model.uncertainty_head_l4),
             ("uncertainty L5", model.uncertainty_head_l5),
+            ("budget L4", model.budget_head_l4),
+            ("budget L5", model.budget_head_l5),
             ("saliency L4", model.saliency_head_l4),
             ("saliency L5", model.saliency_head_l5),
             ("final saliency", model.output_proj),
@@ -415,6 +510,7 @@ def main():
     sparse_attention_equivalence_test()
     global_attention_test()
     warmup_randomness_test()
+    legacy_budget_checkpoint_test()
     sparse_scatter_reconstruction_test()
     evaluation_ablation_test()
     uahs_training_and_no_gt_leak_test()

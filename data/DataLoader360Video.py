@@ -1,4 +1,3 @@
-import random
 from pathlib import Path
 
 import cv2
@@ -52,7 +51,6 @@ class SaliencyDataset(Dataset):
         root_dir,
         video_id,
         dataset_kwargs,
-        augmentation_kwargs=None,
         data_type="train",
         include_partial=False,
     ):
@@ -74,7 +72,6 @@ class SaliencyDataset(Dataset):
 
         self.norm_mean = torch.tensor([0.485, 0.456, 0.406])
         self.norm_std = torch.tensor([0.229, 0.224, 0.225])
-        self.augmentation_kwargs = augmentation_kwargs or {}
 
         split_name = "training" if data_type == "train" else "testing"
         self.video_base_dir = self.root_dir / "videos" / data_type
@@ -257,7 +254,7 @@ class AVSSaliencyDataset(Dataset):
 
     IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
 
-    def __init__(self, dataname, root_dir, video_id, dataset_kwargs, augmentation_kwargs=None):
+    def __init__(self, dataname, root_dir, video_id, dataset_kwargs):
         self.dataname = dataname
         self.root_dir = Path(root_dir)
         self.video_ids = [str(item) for item in video_id]
@@ -272,11 +269,6 @@ class AVSSaliencyDataset(Dataset):
 
         self.norm_mean = torch.tensor([0.485, 0.456, 0.406])
         self.norm_std = torch.tensor([0.229, 0.224, 0.225])
-
-        augmentation_kwargs = augmentation_kwargs or {}
-        self.color_augmentation = augmentation_kwargs.get("color_augmentation", False)
-        self.lr_flip_augmentation = augmentation_kwargs.get("lr_flip_augmentation", False)
-        self.yaw_rotation_augmentation = augmentation_kwargs.get("yaw_rotation_augmentation", False)
 
         self.data_list = self._build_data_list()
         if not self.data_list:
@@ -336,11 +328,6 @@ class AVSSaliencyDataset(Dataset):
     def __getitem__(self, idx):
         item = self.data_list[idx]
 
-                                     
-        yaw_rotat = self.yaw_rotation_augmentation and random.random() > 0.5
-        roll_ratio = random.randint(0, 100) / 100.0
-        lr_flip = self.lr_flip_augmentation and random.random() > 0.5
-
         sals = []
         sphere_rgbs = []
         sphere_sals = []
@@ -351,16 +338,6 @@ class AVSSaliencyDataset(Dataset):
             fix = cv2.imread(fix_path, cv2.IMREAD_GRAYSCALE)
             if rgb is None or sal is None or fix is None:
                 raise RuntimeError(f"Corrupted data: {rgb_path}, {sal_path}, {fix_path}")
-
-            if yaw_rotat:
-                shift = int(rgb.shape[1] * roll_ratio)
-                rgb = np.roll(rgb, shift, axis=1)
-                sal = np.roll(sal, shift, axis=1)
-                fix = np.roll(fix, shift, axis=1)
-            if lr_flip:
-                rgb = np.fliplr(rgb)
-                sal = np.fliplr(sal)
-                fix = np.fliplr(fix)
 
             sphere_rgb, sphere_sal, sphere_fix = _sample_to_sphere(
                 self.sphere_grid_tensor, rgb, sal, fix

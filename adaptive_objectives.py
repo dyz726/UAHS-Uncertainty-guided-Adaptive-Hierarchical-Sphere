@@ -4,6 +4,39 @@ import torch
 
 
 @torch.no_grad()
+def build_error_supervised_budget(
+        target,
+        prediction,
+        face_areas,
+        error_threshold,
+        error_temperature,
+        eligible_mask=None,
+):
+    """Build an area-weighted soft refinement demand from prediction error.
+
+    The denominator is always the complete sphere. When ``eligible_mask`` is
+    supplied, only eligible faces contribute to the numerator; consequently a
+    child-stage target cannot request area outside its parent-stage region.
+    """
+    if target.shape != prediction.shape:
+        raise ValueError("target and prediction must have identical shapes")
+    if target.shape[-1] != face_areas.numel():
+        raise ValueError("target and face_areas have different face counts")
+    if error_temperature <= 0:
+        raise ValueError("error_temperature must be positive")
+    residual = (target - prediction.detach()).abs()
+    demand = torch.sigmoid(
+        (residual - float(error_threshold)) / float(error_temperature)
+    )
+    if eligible_mask is not None:
+        if eligible_mask.shape != demand.shape:
+            raise ValueError("eligible_mask must have the same shape as target")
+        demand = demand * eligible_mask.detach().to(demand.dtype)
+    areas = face_areas.to(device=demand.device, dtype=demand.dtype)
+    return (demand * areas).sum(dim=-1) / areas.sum()
+
+
+@torch.no_grad()
 def build_fixed_area_target(
         scores,
         face_areas,

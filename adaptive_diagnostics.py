@@ -157,22 +157,28 @@ def build_uahs_selection_targets(
         outputs,
         ground_truth,
         model,
-        target_ratio_l1,
-        target_ratio_l2,
+        target_ratio_l1=None,
+        target_ratio_l2=None,
 ):
-    """Build oracle fixed-area targets used only by loss/evaluation."""
+    """Build error-ranked oracle masks at the model's predicted budgets."""
     target_l4 = model.aggregate_img_values_to_l4_faces(ground_truth)
     target_l5 = model.aggregate_img_values_to_l5_faces(ground_truth)
     error_l4 = (target_l4 - outputs["saliency_l4"]).abs()
     error_l5 = (target_l5 - outputs["saliency_l5"]).abs()
+    if target_ratio_l1 is None:
+        target_ratio_l1 = outputs["budget_l5_pred"]
+    if target_ratio_l2 is None:
+        target_ratio_l2 = outputs["budget_l6_pred"]
     selection_l4 = build_fixed_area_target(
         error_l4,
         model.hierarchy_l4_l5.coarse_face_areas,
         target_ratio_l1,
     )
-    eligible_l5 = model.hierarchy_l4_l5.propagate_coarse_face_values(
-        selection_l4
-    ).bool()
+    eligible_l5 = outputs.get("eligible_face_mask_l5")
+    if eligible_l5 is None:
+        eligible_l5 = model.hierarchy_l4_l5.propagate_coarse_face_values(
+            outputs["hard_face_mask_l4"]
+        ).bool()
     selection_l5 = build_fixed_area_target(
         error_l5,
         model.hierarchy_l5_l6.coarse_face_areas,
@@ -193,11 +199,13 @@ class HierarchicalLevelDiagnostics:
     """Streaming uncertainty and hard-selection evidence for one level."""
 
     def __init__(self, target_ratio):
-        self.target_ratio = float(target_ratio)
+        self.initial_target_ratio = float(target_ratio)
         self.uncertainty = RunningMoments()
         self.error = RunningMoments()
         self.hard_mask = RunningMoments()
         self.area_ratio = RunningMoments()
+        self.predicted_budget = RunningMoments()
+        self.area_minus_budget = RunningMoments()
         self.uncertainty_error = RunningPairMoments()
         self.spearman = RunningMoments()
         self.selection_iou = RunningMoments()
@@ -211,6 +219,7 @@ class HierarchicalLevelDiagnostics:
             error,
             hard_mask,
             area_ratio,
+            predicted_budget,
             predicted_selection,
             target_selection,
             face_areas,
@@ -219,6 +228,8 @@ class HierarchicalLevelDiagnostics:
         self.error.update(error)
         self.hard_mask.update(hard_mask)
         self.area_ratio.update(area_ratio)
+        self.predicted_budget.update(predicted_budget)
+        self.area_minus_budget.update(area_ratio - predicted_budget)
         self.uncertainty_error.update(uncertainty, error)
         self.calibration.update(uncertainty, error)
         self.spearman.update(per_frame_spearman(uncertainty, error))
@@ -253,11 +264,9 @@ class HierarchicalLevelDiagnostics:
             "hard_mask": self.hard_mask.summary(),
             "actual_refinement_area": {
                 **area_ratio,
-                "target": self.target_ratio,
-                "mean_minus_target": (
-                    None if area_ratio["mean"] is None
-                    else area_ratio["mean"] - self.target_ratio
-                ),
+                "initial_legacy_budget": self.initial_target_ratio,
+                "predicted_budget": self.predicted_budget.summary(),
+                "actual_minus_predicted": self.area_minus_budget.summary(),
             },
             "selection": {
                 "iou": self.selection_iou.summary(),
@@ -297,10 +306,12 @@ class UAHSDiagnosticsAccumulator:
             "saliency",
             "saliency_l4",
             "uncertainty_l4",
+            "budget_l5_pred",
             "hard_face_mask_l4",
             "selected_area_l1",
             "saliency_l5",
             "uncertainty_l5",
+            "budget_l6_pred",
             "hard_face_mask_l5_effective",
             "selected_area_l2",
             "selected_vertex_ratio_l5",
@@ -323,8 +334,6 @@ class UAHSDiagnosticsAccumulator:
             outputs,
             ground_truth,
             model,
-            self.target_ratio_l1,
-            self.target_ratio_l2,
         )
         predicted_l4 = outputs["hard_face_mask_l4"]
         predicted_l5 = outputs["hard_face_mask_l5_effective"]
@@ -346,6 +355,7 @@ class UAHSDiagnosticsAccumulator:
                 targets["error_l4"][valid],
                 outputs["hard_face_mask_l4"][valid],
                 outputs["selected_area_l1"][valid],
+                outputs["budget_l5_pred"][valid],
                 predicted_l4[valid],
                 targets["selection_l4"][valid],
                 model.hierarchy_l4_l5.coarse_face_areas,
@@ -355,6 +365,7 @@ class UAHSDiagnosticsAccumulator:
                 targets["error_l5"][valid],
                 outputs["hard_face_mask_l5_effective"][valid],
                 outputs["selected_area_l2"][valid],
+                outputs["budget_l6_pred"][valid],
                 predicted_l5[valid],
                 targets["selection_l5"][valid],
                 model.hierarchy_l5_l6.coarse_face_areas,

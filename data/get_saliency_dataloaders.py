@@ -8,13 +8,6 @@ from torch.utils.data import DataLoader
 from .DataLoader360Video import AVSSaliencyDataset, SaliencyDataset
 
 
-NO_AUGMENTATION = {
-    "color_augmentation": False,
-    "lr_flip_augmentation": False,
-    "yaw_rotation_augmentation": False,
-}
-
-
 def _video_ids(dataset_root_dir, data_type):
     annotation_split = "training" if data_type == "train" else "testing"
     annotation_dir = os.path.join(dataset_root_dir, annotation_split)
@@ -59,7 +52,6 @@ def get_dataloaders(
     dataset_name: str,
     dataset_root_dir: Optional[str],
     dataset_kwargs: Dict[str, Any],
-    augmentation_kwargs: Dict[str, Any],
     train_batch_size: int,
     val_batch_size: int,
     num_workers: int,
@@ -81,7 +73,6 @@ def get_dataloaders(
                 root_dir=dataset_root_dir,
                 video_id=test_videos,
                 dataset_kwargs=dataset_kwargs,
-                augmentation_kwargs=NO_AUGMENTATION,
             )
         else:
             video_names = _avs_video_ids(dataset_root_dir, "train", dataset_split)
@@ -102,14 +93,12 @@ def get_dataloaders(
                 root_dir=dataset_root_dir,
                 video_id=train_videos,
                 dataset_kwargs=dataset_kwargs,
-                augmentation_kwargs=augmentation_kwargs,
             )
             dataset_val = AVSSaliencyDataset(
                 dataname=dataset_name,
                 root_dir=dataset_root_dir,
                 video_id=val_videos,
                 dataset_kwargs=dataset_kwargs,
-                augmentation_kwargs=NO_AUGMENTATION,
             )
     elif dataset_name in {"Sports-360", "SVGC_AVA"}:
                                                               
@@ -123,7 +112,6 @@ def get_dataloaders(
                 root_dir=dataset_root_dir,
                 video_id=test_videos,
                 dataset_kwargs=dataset_kwargs,
-                augmentation_kwargs=NO_AUGMENTATION,
                 data_type="test",
                 include_partial=False,
             )
@@ -146,7 +134,6 @@ def get_dataloaders(
                 root_dir=dataset_root_dir,
                 video_id=train_videos,
                 dataset_kwargs=dataset_kwargs,
-                augmentation_kwargs=augmentation_kwargs,
                 data_type="train",
             )
             dataset_val = SaliencyDataset(
@@ -154,7 +141,6 @@ def get_dataloaders(
                 root_dir=dataset_root_dir,
                 video_id=val_videos,
                 dataset_kwargs=dataset_kwargs,
-                augmentation_kwargs=NO_AUGMENTATION,
                 data_type="train",
             )
     else:
