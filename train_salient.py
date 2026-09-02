@@ -18,9 +18,12 @@ from trimesh_utils import *
 EPS = 2.2204e-16
 BUDGET_LOG_NAMES = (
     "budget_l5_pred",
+    "budget_l5_raw_target",
     "budget_l5_target",
     "budget_l6_pred",
     "budget_l6_target",
+    "budget_l6_alpha_pred",
+    "budget_l6_alpha_target",
     "budget_l5_selected_area",
     "budget_l6_selected_area",
     "budget_loss",
@@ -540,6 +543,25 @@ class Trainer:
         weights = weights / weights.sum()
         return (values * weights.reshape(1, 1, -1)).sum(dim=-1).mean()
 
+    @staticmethod
+    def area_weighted_masked_mean(values, face_areas, mask):
+        """Average each non-empty frame over only its eligible spherical area."""
+        if mask.shape != values.shape:
+            raise ValueError("mask and values must have identical shapes")
+        areas = face_areas.to(device=values.device, dtype=values.dtype)
+        weights = (
+            areas.reshape(1, 1, -1)
+            * mask.detach().to(device=values.device, dtype=values.dtype)
+        )
+        numerator = (values * weights).sum(dim=-1)
+        denominator = weights.sum(dim=-1)
+        valid = denominator > 0
+        per_frame = numerator / denominator.clamp_min(
+            torch.finfo(values.dtype).eps
+        )
+        per_frame = torch.where(valid, per_frame, torch.zeros_like(per_frame))
+        return per_frame.sum() / valid.to(values.dtype).sum().clamp_min(1)
+
     def compute_uahs_losses(self, ground_truth, outputs):
         """Supervise saliency, uncertainty, and detached-U dynamic budgets."""
         B, T = ground_truth.shape[:2]
@@ -571,15 +593,21 @@ class Trainer:
         loss_uncertainty_l4 = self.area_weighted_mean(
             laplace_l4, self.model.hierarchy_l4_l5.coarse_face_areas
         )
-        loss_uncertainty_l5 = self.area_weighted_mean(
-            laplace_l5, self.model.hierarchy_l5_l6.coarse_face_areas
+        loss_uncertainty_l5 = self.area_weighted_masked_mean(
+            laplace_l5,
+            self.model.hierarchy_l5_l6.coarse_face_areas,
+            outputs["eligible_face_mask_l5"],
         )
-        budget_l5_target = build_error_supervised_budget(
+        budget_l5_raw_target = build_error_supervised_budget(
             target_l4,
             saliency_l4,
             self.model.hierarchy_l4_l5.coarse_face_areas,
             self.args.budget_error_threshold_l4,
             self.args.budget_error_temperature_l4,
+        )
+        budget_l5_target = budget_l5_raw_target.clamp(
+            min=self.model.budget_l5_min,
+            max=self.model.budget_l5_max,
         )
         budget_l6_target = build_error_supervised_budget(
             target_l5,
@@ -591,11 +619,17 @@ class Trainer:
         )
         budget_l5_pred = outputs["budget_l5_pred"]
         budget_l6_pred = outputs["budget_l6_pred"]
+        budget_l6_alpha_pred = outputs["budget_l6_alpha"]
+        selected_area_l5 = outputs["selected_area_l1"].detach()
+        budget_l6_alpha_target = (
+            budget_l6_target
+            / selected_area_l5.clamp_min(torch.finfo(budget_l6_target.dtype).eps)
+        ).clamp(0, 1)
         loss_budget_l5 = F.smooth_l1_loss(
             budget_l5_pred, budget_l5_target
         )
         loss_budget_l6 = F.smooth_l1_loss(
-            budget_l6_pred, budget_l6_target
+            budget_l6_alpha_pred, budget_l6_alpha_target
         )
         return {
             "loss_saliency_l4": loss_saliency_l4,
@@ -605,9 +639,12 @@ class Trainer:
             "loss_budget_l5": loss_budget_l5,
             "loss_budget_l6": loss_budget_l6,
             "budget_l5_pred": budget_l5_pred.mean(),
+            "budget_l5_raw_target": budget_l5_raw_target.mean(),
             "budget_l5_target": budget_l5_target.mean(),
             "budget_l6_pred": budget_l6_pred.mean(),
             "budget_l6_target": budget_l6_target.mean(),
+            "budget_l6_alpha_pred": budget_l6_alpha_pred.mean(),
+            "budget_l6_alpha_target": budget_l6_alpha_target.mean(),
             "budget_l5_selected_area": outputs["selected_area_l1"].mean(),
             "budget_l6_selected_area": outputs["selected_area_l2"].mean(),
         }
@@ -829,9 +866,12 @@ class Trainer:
             )
             for name in (
                     "budget_l5_pred",
+                    "budget_l5_raw_target",
                     "budget_l5_target",
                     "budget_l6_pred",
                     "budget_l6_target",
+                    "budget_l6_alpha_pred",
+                    "budget_l6_alpha_target",
                     "budget_l5_selected_area",
                     "budget_l6_selected_area",
             ):

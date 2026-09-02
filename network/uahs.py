@@ -532,6 +532,9 @@ class UAHS(nn.Module):
             hard_l4 = self._validate_override(
                 hard_mask_overrides["l4"], hard_l4, "hard_mask_overrides['l4']"
             )
+        selected_area_l1 = self._area_ratio(
+            hard_l4, self.hierarchy_l4_l5.coarse_face_areas
+        )
         child_faces_l5 = self.hierarchy_l4_l5.propagate_coarse_face_values(
             hard_l4
         )
@@ -579,7 +582,10 @@ class UAHS(nn.Module):
             self.hierarchy_l5_l6.coarse_face_areas,
             eligible_mask=eligible_l5,
         )
-        budget_l6_pred = budget_l5_pred * budget_l6_alpha
+        # Base the child budget on the area that was actually routed into L5.
+        # The hard selected area is detached/non-differentiable, so L6 budget
+        # supervision cannot update the head that predicts B5.
+        budget_l6_pred = selected_area_l1.detach() * budget_l6_alpha
         score_l5 = self._selection_scores(
             selector_mode,
             uncertainty_l5,
@@ -642,9 +648,6 @@ class UAHS(nn.Module):
                 batch_size, time_steps, vertices_l6, self.out_channels
             ))
 
-        selected_area_l1 = self._area_ratio(
-            hard_l4, self.hierarchy_l4_l5.coarse_face_areas
-        )
         selected_area_l2 = self._area_ratio(
             hard_l5_effective, self.hierarchy_l5_l6.coarse_face_areas
         )

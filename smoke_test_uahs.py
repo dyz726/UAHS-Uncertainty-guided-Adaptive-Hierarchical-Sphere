@@ -274,8 +274,9 @@ def legacy_budget_checkpoint_test():
     assert torch.allclose(
         outputs["budget_l5_pred"], torch.tensor([[0.25]]), atol=1e-6
     )
+    assert torch.allclose(outputs["budget_l6_alpha"], torch.tensor([[0.5]]))
     assert torch.allclose(
-        outputs["budget_l6_pred"], torch.tensor([[0.125]]), atol=1e-6
+        outputs["budget_l6_pred"], outputs["selected_area_l1"] * 0.5
     )
     print("legacy checkpoint dynamic-budget initialization: OK")
 
@@ -348,6 +349,9 @@ def uahs_training_and_no_gt_leak_test():
     model.eval()
     first = model(inputs, return_aux=True)
     second = model(inputs, return_aux=True)
+    inference_without_gt = model(inputs)
+    assert tuple(inference_without_gt.shape) == (1, 2, 642)
+    assert_finite("inference without GT", inference_without_gt)
     forward_keys = (
         "saliency",
         "uncertainty_l4",
@@ -381,6 +385,9 @@ def uahs_training_and_no_gt_leak_test():
         assert bool((
             (selected["selected_area_l2"] - selected["budget_l6_pred"]).abs()
             <= tolerance_l2
+        ).all())
+        assert bool((
+            selected["budget_l6_pred"] <= selected["selected_area_l1"]
         ).all())
         eligible = model.hierarchy_l4_l5.propagate_coarse_face_values(
             selected["hard_face_mask_l4"]
@@ -433,13 +440,51 @@ def uahs_training_and_no_gt_leak_test():
         "loss_budget_l5",
         "loss_budget_l6",
         "budget_l5_pred",
+        "budget_l5_raw_target",
         "budget_l5_target",
         "budget_l6_pred",
         "budget_l6_target",
+        "budget_l6_alpha_pred",
+        "budget_l6_alpha_target",
         "budget_l5_selected_area",
         "budget_l6_selected_area",
     }
     assert not torch.equal(losses_a["loss_uncertainty_l4"], losses_b["loss_uncertainty_l4"])
+    for losses_for_target in (losses_a, losses_b):
+        assert model.budget_l5_min <= float(losses_for_target["budget_l5_target"])
+        assert float(losses_for_target["budget_l5_target"]) <= model.budget_l5_max
+    saturated_losses = trainer.compute_uahs_losses(
+        torch.ones_like(ground_truth_a), first
+    )
+    assert float(saturated_losses["budget_l5_raw_target"]) > model.budget_l5_max
+    assert torch.allclose(
+        saturated_losses["budget_l5_target"],
+        torch.tensor(
+            model.budget_l5_max,
+            dtype=saturated_losses["budget_l5_target"].dtype,
+        ),
+    ), "an unreachable B5 target was not clamped to the prediction range"
+
+    eligible = first["eligible_face_mask_l5"]
+    outside_changed = dict(first)
+    outside_changed["uncertainty_l5"] = torch.where(
+        eligible,
+        first["uncertainty_l5"],
+        first["uncertainty_l5"] * 10 + 1,
+    )
+    outside_losses = trainer.compute_uahs_losses(ground_truth_a, outside_changed)
+    assert torch.allclose(
+        losses_a["loss_uncertainty_l5"],
+        outside_losses["loss_uncertainty_l5"],
+        atol=1e-7,
+    ), "ineligible L5 uncertainty changed the masked uncertainty loss"
+    empty_mask_loss = Trainer.area_weighted_masked_mean(
+        first["uncertainty_l5"],
+        model.hierarchy_l5_l6.coarse_face_areas,
+        torch.zeros_like(first["uncertainty_l5"], dtype=torch.bool),
+    )
+    assert_finite("empty eligible uncertainty loss", empty_mask_loss)
+    assert float(empty_mask_loss) == 0.0
 
     model.train()
     outputs = model(inputs, return_aux=True)
@@ -448,9 +493,28 @@ def uahs_training_and_no_gt_leak_test():
         outputs["budget_l5_pred"], torch.full((1, 2), 0.25), atol=1e-6
     )
     assert torch.allclose(
-        outputs["budget_l6_pred"], torch.full((1, 2), 0.125), atol=1e-6
+        outputs["budget_l6_alpha"], torch.full((1, 2), 0.5), atol=1e-6
     )
-    assert bool((outputs["budget_l6_pred"] <= outputs["budget_l5_pred"]).all())
+    assert torch.allclose(
+        outputs["budget_l6_pred"], outputs["selected_area_l1"] * 0.5,
+        atol=1e-6,
+    )
+    assert bool((
+        outputs["budget_l6_pred"] <= outputs["selected_area_l1"]
+    ).all())
+
+    model.zero_grad(set_to_none=True)
+    losses["loss_budget_l6"].backward(retain_graph=True)
+    assert all(
+        parameter.grad is None
+        for parameter in model.budget_head_l4.parameters()
+    ), "L6 budget loss unexpectedly updated the B5 budget head"
+    assert_gradient("budget L5 alpha", model.budget_head_l5)
+    assert all(
+        parameter.grad is None
+        for module in (model.uncertainty_head_l4, model.uncertainty_head_l5)
+        for parameter in module.parameters()
+    ), "L6 budget loss unexpectedly updated an uncertainty head"
 
     model.zero_grad(set_to_none=True)
     (losses["loss_budget_l5"] + losses["loss_budget_l6"]).backward(

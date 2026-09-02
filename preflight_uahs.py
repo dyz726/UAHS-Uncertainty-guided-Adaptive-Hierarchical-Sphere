@@ -237,7 +237,7 @@ def routing_report(model, outputs):
             <= tolerance_l2
         ).all()),
         "hierarchical_budget": bool((
-            outputs["budget_l6_pred"] <= outputs["budget_l5_pred"]
+            outputs["budget_l6_pred"] <= outputs["selected_area_l1"]
         ).all()),
         "l5_selected_queries_only": (
             0 < queries_l5 < dense_l5
@@ -365,6 +365,8 @@ def run_preflight(sequence_length=12, iterations=3):
                 "budget_l5_target": float(losses["budget_l5_target"]),
                 "budget_l6_pred": tensor_statistics(outputs["budget_l6_pred"]),
                 "budget_l6_target": float(losses["budget_l6_target"]),
+                "budget_l6_alpha_pred": float(losses["budget_l6_alpha_pred"]),
+                "budget_l6_alpha_target": float(losses["budget_l6_alpha_target"]),
                 "temporal_mask_iou_l4": temporal_mask_iou(
                     outputs["hard_face_mask_l4"]
                 ),
