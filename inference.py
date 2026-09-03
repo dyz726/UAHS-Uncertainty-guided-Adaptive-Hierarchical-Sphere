@@ -20,7 +20,6 @@ from train import parser
 from trimesh_utils import IcoSphereRef, asSpherical
 
 
-
 class InferenceRunner:
     def __init__(self, args):
         self.args = args
@@ -91,29 +90,60 @@ class InferenceRunner:
             (key[7:] if key.startswith("module.") else key): value
             for key, value in state_dict.items()
         }
-        try:
-            incompatible = self.model.load_state_dict(state_dict, strict=False)
-        except RuntimeError as error:
-            raise RuntimeError(
-                "Checkpoint tensors do not match the selected model."
-            ) from error
-        allowed_missing_prefixes = ("budget_head_l4.", "budget_head_l5.")
-        disallowed_missing = [
-            key for key in incompatible.missing_keys
-            if not key.startswith(allowed_missing_prefixes)
+        model_state = self.model.state_dict()
+        source_keys = set(state_dict)
+        has_budget_heads = any(
+            key.startswith("budget_head_") for key in source_keys
+        )
+        has_old_l5_head = any(
+            key.startswith("budget_head_l4.mlp.") for key in source_keys
+        )
+        allowed_missing_prefixes = ()
+        allowed_unexpected_prefixes = ()
+        if not has_budget_heads:
+            allowed_missing_prefixes = ("budget_head_l4.", "budget_head_l5.")
+        elif has_old_l5_head:
+            allowed_missing_prefixes = ("budget_head_l4.",)
+            allowed_unexpected_prefixes = ("budget_head_l4.mlp.",)
+
+        shape_mismatches = [
+            key for key, value in state_dict.items()
+            if key in model_state and value.shape != model_state[key].shape
         ]
-        if disallowed_missing or incompatible.unexpected_keys:
+        compatible_state = {
+            key: value for key, value in state_dict.items()
+            if key in model_state and value.shape == model_state[key].shape
+        }
+        missing = [
+            key for key in model_state
+            if key not in compatible_state
+            and not key.startswith(allowed_missing_prefixes)
+        ]
+        unexpected = [
+            key for key in state_dict
+            if key not in model_state
+            and not key.startswith(allowed_unexpected_prefixes)
+        ]
+        if missing or unexpected or shape_mismatches:
             raise RuntimeError(
                 "Checkpoint does not match the selected model: "
-                f"missing={disallowed_missing}, "
-                f"unexpected={incompatible.unexpected_keys}"
+                f"missing={missing}, unexpected={unexpected}, "
+                f"shape_mismatches={shape_mismatches}"
             )
-        if incompatible.missing_keys:
+        model_state.update(compatible_state)
+        self.model.load_state_dict(model_state, strict=True)
+        if not has_budget_heads:
             print(
                 "Checkpoint predates dynamic budgets; initialized budget heads "
-                "at the legacy 0.25 / 0.125 operating point."
+                "at the configured 0.25 / 0.125 operating point."
             )
-        print(f"Loaded {len(state_dict)} model tensors from {path}")
+        elif has_old_l5_head:
+            print(
+                "Checkpoint uses the former L5 mean/std budget head; its "
+                "weights are ignored and the new DeepSets head retains its "
+                "safe 0.25 initialization."
+            )
+        print(f"Loaded {len(compatible_state)} model tensors from {path}")
 
     def _to_device(self, batch):
         return {

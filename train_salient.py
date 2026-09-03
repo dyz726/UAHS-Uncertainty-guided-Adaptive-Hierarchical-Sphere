@@ -7,10 +7,14 @@ import tqdm
 import wandb              
 import numpy as np
 import cv2
+import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
-from adaptive_objectives import build_error_supervised_budget
+from adaptive_objectives import (
+    budget_regression_metrics,
+    build_error_supervised_budget,
+)
 from data.get_saliency_dataloaders import get_dataloaders         
 from network.sphere_model import build_saliency_model
 from Sphere_SalientScore_torch import *
@@ -28,6 +32,12 @@ BUDGET_LOG_NAMES = (
     "budget_l6_selected_area",
     "budget_loss",
 )
+BUDGET_FRAME_KEYS = {
+    "l5": ("budget_l5_pred_per_frame", "budget_l5_target_per_frame"),
+    "l6": ("budget_l6_pred_per_frame", "budget_l6_target_per_frame"),
+}
+
+
 class Trainer:
     def __init__(self, args):
         self.args = args
@@ -280,6 +290,41 @@ class Trainer:
             {"params": no_decay_params, "weight_decay": 0.0},
         ]
 
+    @staticmethod
+    def new_budget_diagnostic_buffer():
+        return {
+            level: {"prediction": [], "target": []}
+            for level in BUDGET_FRAME_KEYS
+        }
+
+    @staticmethod
+    def update_budget_diagnostic_buffer(buffer, outputs):
+        for level, (prediction_key, target_key) in BUDGET_FRAME_KEYS.items():
+            if prediction_key not in outputs or target_key not in outputs:
+                continue
+            buffer[level]["prediction"].append(
+                outputs[prediction_key].detach().reshape(-1).cpu()
+            )
+            buffer[level]["target"].append(
+                outputs[target_key].detach().reshape(-1).cpu()
+            )
+
+    @staticmethod
+    def summarize_budget_diagnostic_buffer(buffer):
+        summary = {}
+        for level, values in buffer.items():
+            if not values["prediction"]:
+                continue
+            metrics = budget_regression_metrics(
+                torch.cat(values["prediction"]),
+                torch.cat(values["target"]),
+            )
+            summary.update({
+                f"budget_{level}_{name}": value
+                for name, value in metrics.items()
+            })
+        return summary
+
     def get_learning_rate(self, optimizer_step: int) -> float:
         if self.args.lr_scheduler != "warmup_cosine":
             return self.optimizer.param_groups[0]["lr"]
@@ -310,13 +355,12 @@ class Trainer:
         source_keys = set(pretrained_dict)
         model_dict = model.state_dict()
 
-                    
-        pretrained_dict = {k: v for k, v in pretrained_dict.items()
-                           if k in model_dict and v.shape == model_dict[k].shape}
-                     
-        match_keys = [k for k, v in pretrained_dict.items() if k in model_dict and v.shape == model_dict[k].shape]
+        pretrained_dict = {
+            key: value for key, value in pretrained_dict.items()
+            if key in model_dict and value.shape == model_dict[key].shape
+        }
         print(
-            f"Loaded {len(match_keys)}/{len(model_dict)} model tensors "
+            f"Loaded {len(pretrained_dict)}/{len(model_dict)} model tensors "
             f"from {source_parameter_count} tensors in {pretrained_path}"
         )
         if not any(key.startswith("budget_head_") for key in source_keys):
@@ -324,8 +368,16 @@ class Trainer:
                 "Checkpoint predates dynamic budgets; budget heads retain "
                 "their safe 0.25 / 0.125 initialization."
             )
+        elif not any(
+                key.startswith("budget_head_l4.face_mlp.")
+                for key in source_keys
+        ):
+            print(
+                "Checkpoint uses the former L5 mean/std budget head; its "
+                "weights are ignored and the new DeepSets head retains its "
+                "safe 0.25 initialization."
+            )
 
-                 
         model_dict.update(pretrained_dict)
         model.load_state_dict(model_dict)
 
@@ -647,6 +699,10 @@ class Trainer:
             "budget_l6_alpha_target": budget_l6_alpha_target.mean(),
             "budget_l5_selected_area": outputs["selected_area_l1"].mean(),
             "budget_l6_selected_area": outputs["selected_area_l2"].mean(),
+            "budget_l5_pred_per_frame": budget_l5_pred,
+            "budget_l5_target_per_frame": budget_l5_target,
+            "budget_l6_pred_per_frame": budget_l6_pred,
+            "budget_l6_target_per_frame": budget_l6_target,
         }
 
     def train_one_epoch(self):
@@ -660,6 +716,7 @@ class Trainer:
         loss_sum = []
         sal_metrics = {'AUC': [], 'NSS': [], 'CC': [], 'SIM': [], 'KL': []}
         budget_metrics = {name: [] for name in BUDGET_LOG_NAMES}
+        budget_diagnostic_buffer = self.new_budget_diagnostic_buffer()
         for batch_idx, inputs in enumerate(pbar, start=1):
             self.mini_step += 1
             inputs_ = self.inputs_to_device(inputs)
@@ -668,6 +725,9 @@ class Trainer:
             for name in BUDGET_LOG_NAMES:
                 if name in outputs:
                     budget_metrics[name].append(float(outputs[name].item()))
+            self.update_budget_diagnostic_buffer(
+                budget_diagnostic_buffer, outputs
+            )
 
             group_start = ((batch_idx - 1) // self.args.accum_grads) * self.args.accum_grads
             group_size = min(
@@ -714,10 +774,15 @@ class Trainer:
             for name, values in budget_metrics.items()
             if values
         }
+        train_budget_diagnostics = self.summarize_budget_diagnostic_buffer(
+            budget_diagnostic_buffer
+        )
         print("Train Mean Loss:", train_loss)
         print("Train Metrics:", train_metrics)
         if train_budget_metrics:
             print("Train Dynamic Budgets:", train_budget_metrics)
+        if train_budget_diagnostics:
+            print("Train Per-frame Budget Diagnostics:", train_budget_diagnostics)
 
         if self.writer:
             self.writer.add_scalar("train/loss", train_loss, self.epoch)
@@ -727,6 +792,8 @@ class Trainer:
             for name, value in train_metrics.items():
                 self.writer.add_scalar(f"train/{name}", value, self.epoch)
             for name, value in train_budget_metrics.items():
+                self.writer.add_scalar(f"train/{name}", value, self.epoch)
+            for name, value in train_budget_diagnostics.items():
                 self.writer.add_scalar(f"train/{name}", value, self.epoch)
             self.writer.flush()
 
@@ -739,6 +806,10 @@ class Trainer:
                     **{
                         f"train/{name}": value
                         for name, value in train_budget_metrics.items()
+                    },
+                    **{
+                        f"train/{name}": value
+                        for name, value in train_budget_diagnostics.items()
                     },
                 },
                 step=self.epoch,
@@ -755,6 +826,7 @@ class Trainer:
         loss_sum = []
         sal_metrics = {'AUC': [], 'NSS': [], 'CC': [], 'SIM': [], 'KL': []}
         budget_metrics = {name: [] for name in BUDGET_LOG_NAMES}
+        budget_diagnostic_buffer = self.new_budget_diagnostic_buffer()
         with torch.no_grad():
             for batch_idx, inputs in enumerate(pbar):
                 inputs_ = self.inputs_to_device(inputs)
@@ -764,6 +836,9 @@ class Trainer:
                 for name in BUDGET_LOG_NAMES:
                     if name in outputs:
                         budget_metrics[name].append(float(outputs[name].item()))
+                self.update_budget_diagnostic_buffer(
+                    budget_diagnostic_buffer, outputs
+                )
                                
                 pred_sal = outputs["pred_sal"]                      
                 gt_sal = inputs_["normalized_sphere_sal"]                      
@@ -786,16 +861,23 @@ class Trainer:
             for name, values in budget_metrics.items()
             if values
         }
+        val_budget_diagnostics = self.summarize_budget_diagnostic_buffer(
+            budget_diagnostic_buffer
+        )
         print("Val Mean Loss:", current_val_loss)
         print("Val Metrics:", val_metrics)
         if val_budget_metrics:
             print("Val Dynamic Budgets:", val_budget_metrics)
+        if val_budget_diagnostics:
+            print("Val Per-frame Budget Diagnostics:", val_budget_diagnostics)
 
         if self.writer:
             self.writer.add_scalar("val/loss", current_val_loss, self.epoch)
             for name, value in val_metrics.items():
                 self.writer.add_scalar(f"val/{name}", value, self.epoch)
             for name, value in val_budget_metrics.items():
+                self.writer.add_scalar(f"val/{name}", value, self.epoch)
+            for name, value in val_budget_diagnostics.items():
                 self.writer.add_scalar(f"val/{name}", value, self.epoch)
             self.writer.flush()
 
@@ -807,6 +889,10 @@ class Trainer:
                     **{
                         f"val/{name}": value
                         for name, value in val_budget_metrics.items()
+                    },
+                    **{
+                        f"val/{name}": value
+                        for name, value in val_budget_diagnostics.items()
                     },
                 },
                 step=self.epoch,
@@ -876,6 +962,9 @@ class Trainer:
                     "budget_l6_selected_area",
             ):
                 outputs[name] = auxiliary_losses[name].detach()
+            for prediction_key, target_key in BUDGET_FRAME_KEYS.values():
+                outputs[prediction_key] = auxiliary_losses[prediction_key].detach()
+                outputs[target_key] = auxiliary_losses[target_key].detach()
             outputs["budget_loss"] = budget_loss.detach()
         losses = {
             "loss": total_loss,

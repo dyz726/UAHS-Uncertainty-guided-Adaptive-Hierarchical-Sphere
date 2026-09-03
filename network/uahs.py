@@ -54,7 +54,7 @@ class HardAreaSelector(nn.Module):
 
 
 class DynamicBudgetHead(nn.Module):
-    """Predict a per-frame budget from detached uncertainty statistics."""
+    """Predict a per-frame budget from detached uncertainty mean/std."""
 
     def __init__(
             self,
@@ -78,7 +78,7 @@ class DynamicBudgetHead(nn.Module):
         )
 
     def reset_output(self):
-        """Start as a constant legacy budget while retaining trainability."""
+        """Start at the configured budget while retaining trainability."""
         final = self.mlp[-1]
         nn.init.zeros_(final.weight)
         normalized = (
@@ -115,6 +115,87 @@ class DynamicBudgetHead(nn.Module):
         ).sum(dim=-1) / denominator
         statistics = torch.stack((mean, variance.clamp_min(0).sqrt()), dim=-1)
         unit_budget = torch.sigmoid(self.mlp(statistics).squeeze(-1))
+        return self.output_min + (
+            self.output_max - self.output_min
+        ) * unit_budget
+
+
+class DistributionBudgetHead(nn.Module):
+    """Predict a budget from an area-weighted uncertainty distribution."""
+
+    def __init__(
+            self,
+            initial_output: float,
+            output_min: float = 0.0,
+            output_max: float = 1.0,
+            hidden_dim: int = 8,
+            distribution_dim: int = 8,
+            epsilon: float = 1e-6,
+    ):
+        super().__init__()
+        if not 0 <= output_min < output_max <= 1:
+            raise ValueError("Expected 0 <= output_min < output_max <= 1")
+        if not output_min <= initial_output <= output_max:
+            raise ValueError("initial_output must be inside the output range")
+        if distribution_dim <= 0:
+            raise ValueError("distribution_dim must be positive")
+        if epsilon <= 0:
+            raise ValueError("epsilon must be positive")
+        self.output_min = float(output_min)
+        self.output_max = float(output_max)
+        self.initial_output = float(initial_output)
+        self.distribution_dim = int(distribution_dim)
+        self.epsilon = float(epsilon)
+        self.face_mlp = nn.Sequential(
+            nn.Linear(1, self.distribution_dim),
+            nn.GELU(),
+            nn.Linear(self.distribution_dim, self.distribution_dim),
+            nn.GELU(),
+        )
+        self.global_mlp = nn.Sequential(
+            nn.Linear(self.distribution_dim + 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def reset_output(self):
+        """Initialize the head at its configured constant operating point."""
+        final = self.global_mlp[-1]
+        nn.init.zeros_(final.weight)
+        normalized = (
+            (self.initial_output - self.output_min)
+            / (self.output_max - self.output_min)
+        )
+        normalized = min(max(normalized, 1e-4), 1 - 1e-4)
+        nn.init.constant_(final.bias, math.log(normalized / (1 - normalized)))
+
+    def forward(self, uncertainty: Tensor, face_areas: Tensor) -> Tensor:
+        if uncertainty.shape[-1] != face_areas.numel():
+            raise ValueError("uncertainty and face_areas have different counts")
+        uncertainty = uncertainty.detach()
+        areas = face_areas.to(
+            device=uncertainty.device, dtype=uncertainty.dtype
+        )
+        weights = areas.reshape(*([1] * (uncertainty.ndim - 1)), -1)
+        denominator = weights.sum(dim=-1).clamp_min(
+            torch.finfo(uncertainty.dtype).eps
+        )
+
+        mean = (uncertainty * weights).sum(dim=-1) / denominator
+        variance = (
+            (uncertainty - mean.unsqueeze(-1)).square() * weights
+        ).sum(dim=-1) / denominator
+        statistics = torch.stack((mean, variance.clamp_min(0).sqrt()), dim=-1)
+        face_features = self.face_mlp(
+            torch.log(uncertainty.clamp_min(0) + self.epsilon).unsqueeze(-1)
+        )
+        pooled_features = (
+            face_features * weights.unsqueeze(-1)
+        ).sum(dim=-2) / denominator.unsqueeze(-1)
+        global_features = torch.cat((pooled_features, statistics), dim=-1)
+        unit_budget = torch.sigmoid(
+            self.global_mlp(global_features).squeeze(-1)
+        )
         return self.output_min + (
             self.output_max - self.output_min
         ) * unit_budget
@@ -319,7 +400,7 @@ class UAHS(nn.Module):
         self.saliency_head_l5 = nn.Linear(embed_dim, out_channels)
         self.uncertainty_head_l4 = SphericalUncertaintyHead(embed_dim)
         self.uncertainty_head_l5 = SphericalUncertaintyHead(embed_dim)
-        self.budget_head_l4 = DynamicBudgetHead(
+        self.budget_head_l4 = DistributionBudgetHead(
             initial_output=target_refine_ratio_l1,
             output_min=budget_l5_min,
             output_max=budget_l5_max,
@@ -334,8 +415,8 @@ class UAHS(nn.Module):
         self.output_proj = OutputProj(embed_dim, out_channels)
         self.final_sigmoid = nn.Sigmoid()
         self.apply(self._init_weights)
-        # ``apply`` initializes every Linear first; restore legacy budget biases
-        # last so old and freshly initialized models start at 0.25 / 0.125.
+        # ``apply`` initializes every Linear first; restore the configured
+        # initial budgets last (0.25 / 0.125 with the default arguments).
         self.budget_head_l4.reset_output()
         self.budget_head_l5.reset_output()
 

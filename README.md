@@ -35,9 +35,11 @@ Use `--model_type sphere_uformer` for the unchanged baseline. Run
 
 The two `target_refine_ratio` values are backward-compatible initialization
 points, not fixed runtime budgets. Error-supervised SmoothL1 losses train small
-budget heads from detached, area-weighted uncertainty statistics. Uncertainty
-still learns primarily from the heteroscedastic Laplace loss and directly ranks
-each hard selector; labels never enter `forward()`.
+budget heads from detached uncertainty. The L5 budget uses a standalone,
+area-weighted DeepSets distribution encoder with mean/std auxiliary statistics;
+the L6 budget retains the original mean/std head. Uncertainty still learns
+primarily from the heteroscedastic Laplace loss and directly ranks each hard
+selector; labels never enter `forward()`.
 
 ## Verification
 

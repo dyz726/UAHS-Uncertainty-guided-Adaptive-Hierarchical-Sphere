@@ -1,22 +1,26 @@
 """Geometry, sparsity, gradient, and regression tests for final UAHS."""
 
+import tempfile
 from types import SimpleNamespace
 
 import torch
 
 from adaptive_diagnostics import UAHSDiagnosticsAccumulator
 from adaptive_objectives import (
+    budget_regression_metrics,
     build_error_supervised_budget,
     build_fixed_area_target,
     per_frame_spearman,
 )
+from inference import InferenceRunner
 from network.sphere_model import build_saliency_model
+from network.uahs import DistributionBudgetHead, DynamicBudgetHead
 from network.sphere_PSA import (
     GlobalSphereSelfAttention,
     SparseSphereSelfAttention,
     SphereSelfAttention,
 )
-from train_salient import Trainer
+from train_salient import BUDGET_FRAME_KEYS, Trainer
 from trimesh_utils import IcoSphereHierarchy, IcoSphereRef
 
 
@@ -91,6 +95,81 @@ def tie_aware_spearman_test():
     undefined = per_frame_spearman(torch.ones_like(tied), increasing)
     assert bool(torch.isnan(undefined).all())
     print("tie-aware Spearman and zero-variance handling: OK")
+
+
+def budget_regression_metrics_test():
+    prediction = torch.tensor([0.1, 0.2, 0.3])
+    target = torch.tensor([0.1, 0.3, 0.2])
+    metrics = budget_regression_metrics(prediction, target)
+    assert abs(metrics["pearson"] - 0.5) < 1e-6
+    assert abs(metrics["spearman"] - 0.5) < 1e-6
+    assert abs(metrics["under_budget_ratio"] - 1 / 3) < 1e-6
+    assert metrics["finite_count"] == 3
+    assert metrics["nonfinite_count"] == 0
+    assert abs(metrics["pred_p50"] - 0.2) < 1e-6
+    print("per-frame budget regression diagnostics: OK")
+
+
+def distribution_budget_head_test():
+    """Verify distribution sensitivity, area pooling, and gradient isolation."""
+    torch.manual_seed(7)
+    head = DistributionBudgetHead(
+        initial_output=0.25,
+        output_min=0.05,
+        output_max=0.50,
+        hidden_dim=4,
+        distribution_dim=4,
+    )
+    head.reset_output()
+    initial = head(torch.rand(2, 4), torch.ones(4))
+    assert torch.allclose(initial, torch.full((2,), 0.25), atol=1e-6)
+
+    with torch.no_grad():
+        head.global_mlp[-1].weight.fill_(0.2)
+    first = torch.tensor([[1.0, 1.0, 3.0, 3.0]])
+    second = torch.tensor([[
+        2 - 2 ** 0.5, 2.0, 2.0, 2 + 2 ** 0.5,
+    ]])
+    uncertainty = torch.cat((first, second), dim=0).requires_grad_(True)
+    areas = torch.tensor([0.5, 1.0, 1.5, 2.0])
+    output = head(uncertainty, areas)
+
+    weights = areas.reshape(1, -1)
+    denominator = weights.sum(dim=-1)
+    mean = (uncertainty.detach() * weights).sum(dim=-1) / denominator
+    variance = (
+        (uncertainty.detach() - mean.unsqueeze(-1)).square() * weights
+    ).sum(dim=-1) / denominator
+    statistics = torch.stack((mean, variance.sqrt()), dim=-1)
+    face_features = head.face_mlp(
+        torch.log(uncertainty.detach() + head.epsilon).unsqueeze(-1)
+    )
+    pooled = (
+        face_features * weights.unsqueeze(-1)
+    ).sum(dim=-2) / denominator.unsqueeze(-1)
+    expected_logits = head.global_mlp(
+        torch.cat((pooled, statistics), dim=-1)
+    ).squeeze(-1)
+    expected = head.output_min + (head.output_max - head.output_min) * torch.sigmoid(
+        expected_logits
+    )
+    assert torch.allclose(output, expected, atol=1e-7)
+
+    permutation = torch.tensor([2, 0, 3, 1])
+    permuted = head(uncertainty[:, permutation], areas[permutation])
+    assert torch.allclose(output, permuted, atol=1e-7)
+    equal_areas = torch.ones(4)
+    assert torch.allclose(first.mean(), second.mean(), atol=1e-6)
+    assert torch.allclose(first.std(unbiased=False), second.std(unbiased=False), atol=1e-6)
+    distribution_outputs = head(torch.cat((first, second)), equal_areas)
+    assert not torch.allclose(distribution_outputs[0], distribution_outputs[1])
+
+    output.sum().backward()
+    assert uncertainty.grad is None
+    assert_gradient("distribution budget head", head)
+    assert_gradient("distribution face encoder", head.face_mlp)
+    assert_gradient("distribution global encoder", head.global_mlp)
+    print("area-weighted distribution budget head and detached input: OK")
 
 
 def hierarchy_and_budget_test():
@@ -281,6 +360,73 @@ def legacy_budget_checkpoint_test():
     print("legacy checkpoint dynamic-budget initialization: OK")
 
 
+def distribution_budget_checkpoint_test():
+    """An old L5 mean/std head is replaced, while compatible weights load."""
+    torch.manual_seed(23)
+    source = build_saliency_model(model_args("uahs", img_rank=3)).eval()
+    old_l5_head = DynamicBudgetHead(
+        initial_output=0.25,
+        output_min=0.05,
+        output_max=0.50,
+    )
+    old_l5_head.reset_output()
+    with torch.no_grad():
+        source.budget_head_l5.mlp[0].weight.normal_()
+        source.budget_head_l5.mlp[2].weight.normal_()
+        source.budget_head_l5.mlp[2].bias.fill_(-0.3)
+    old_dynamic_state = {
+        name: value
+        for name, value in source.state_dict().items()
+        if not name.startswith("budget_head_l4.")
+    }
+    old_dynamic_state.update({
+        f"budget_head_l4.{name}": value
+        for name, value in old_l5_head.state_dict().items()
+    })
+    restored = build_saliency_model(model_args("uahs", img_rank=3)).eval()
+    initial_l5_state = {
+        name: value.clone()
+        for name, value in restored.budget_head_l4.state_dict().items()
+    }
+    with tempfile.NamedTemporaryFile(suffix=".pth") as checkpoint:
+        torch.save(old_dynamic_state, checkpoint.name)
+        Trainer.load_pretrained(
+            Trainer.__new__(Trainer), restored, checkpoint.name
+        )
+        inference_model = build_saliency_model(
+            model_args("uahs", img_rank=3)
+        ).eval()
+        initial_inference_l5 = {
+            name: value.clone()
+            for name, value in inference_model.budget_head_l4.state_dict().items()
+        }
+        inference_runner = InferenceRunner.__new__(InferenceRunner)
+        inference_runner.model = inference_model
+        inference_runner._load_weights(checkpoint.name)
+        for name, value in inference_model.budget_head_l4.state_dict().items():
+            assert torch.equal(value, initial_inference_l5[name])
+
+        torch.save(source.state_dict(), checkpoint.name)
+        inference_runner._load_weights(checkpoint.name)
+        for name, value in inference_model.state_dict().items():
+            assert torch.equal(value, source.state_dict()[name])
+    for name, value in restored.budget_head_l4.state_dict().items():
+        assert torch.equal(value, initial_l5_state[name])
+    for name, value in restored.budget_head_l5.state_dict().items():
+        assert torch.equal(
+            value, source.budget_head_l5.state_dict()[name]
+        )
+    with torch.no_grad():
+        prediction = restored.budget_head_l4(
+            torch.rand(1, 2, 80), torch.ones(80)
+        )
+    assert torch.allclose(prediction, torch.full_like(prediction, 0.25))
+    incompatible = restored.load_state_dict(source.state_dict(), strict=True)
+    assert not incompatible.missing_keys
+    assert not incompatible.unexpected_keys
+    print("old L5 mean/std checkpoint cleanly initializes DeepSets head: OK")
+
+
 def sparse_scatter_reconstruction_test():
     torch.manual_seed(29)
     model = build_saliency_model(model_args("uahs", img_rank=3))
@@ -345,6 +491,16 @@ def uahs_training_and_no_gt_leak_test():
     torch.manual_seed(1)
     args = model_args("uahs", img_rank=3)
     model = build_saliency_model(args)
+    assert isinstance(model.budget_head_l4, DistributionBudgetHead)
+    assert isinstance(model.budget_head_l5, DynamicBudgetHead)
+    assert not hasattr(model.budget_head_l4, "mlp")
+    assert not hasattr(model.budget_head_l5, "face_mlp")
+    assert sum(
+        parameter.numel() for parameter in model.budget_head_l4.parameters()
+    ) == 185
+    assert sum(
+        parameter.numel() for parameter in model.budget_head_l5.parameters()
+    ) == 33
     inputs = torch.randn(1, 2, 642, 3)
     model.eval()
     first = model(inputs, return_aux=True)
@@ -429,6 +585,15 @@ def uahs_training_and_no_gt_leak_test():
     trainer.area_weighted_mean = Trainer.area_weighted_mean
     ground_truth_a = torch.rand(1, 2, 642)
     ground_truth_b = torch.rand(1, 2, 642)
+    processed_outputs, processed_losses = trainer.process_batch({
+        "normalized_sphere_rgb": inputs,
+        "normalized_sphere_sal": ground_truth_a,
+        "normalized_sphere_fix": torch.zeros_like(ground_truth_a),
+    })
+    assert_finite("processed total loss", processed_losses["loss"])
+    for prediction_key, target_key in BUDGET_FRAME_KEYS.values():
+        assert tuple(processed_outputs[prediction_key].shape) == (1, 2)
+        assert tuple(processed_outputs[target_key].shape) == (1, 2)
     # Labels only change loss values; forward routing was already fixed.
     losses_a = trainer.compute_uahs_losses(ground_truth_a, first)
     losses_b = trainer.compute_uahs_losses(ground_truth_b, first)
@@ -448,8 +613,34 @@ def uahs_training_and_no_gt_leak_test():
         "budget_l6_alpha_target",
         "budget_l5_selected_area",
         "budget_l6_selected_area",
+        "budget_l5_pred_per_frame",
+        "budget_l5_target_per_frame",
+        "budget_l6_pred_per_frame",
+        "budget_l6_target_per_frame",
     }
     assert not torch.equal(losses_a["loss_uncertainty_l4"], losses_b["loss_uncertainty_l4"])
+    for name in (
+            "budget_l5_pred_per_frame",
+            "budget_l5_target_per_frame",
+            "budget_l6_pred_per_frame",
+            "budget_l6_target_per_frame",
+    ):
+        assert tuple(losses_a[name].shape) == (1, 2)
+    diagnostic_buffer = Trainer.new_budget_diagnostic_buffer()
+    Trainer.update_budget_diagnostic_buffer(
+        diagnostic_buffer, processed_outputs
+    )
+    budget_summary = Trainer.summarize_budget_diagnostic_buffer(
+        diagnostic_buffer
+    )
+    for level in ("l5", "l6"):
+        for name in (
+                "pred_mean", "pred_std", "target_mean", "target_std",
+                "mae", "rmse", "pearson", "spearman",
+                "under_budget_ratio", "pred_p10", "pred_p50", "pred_p90",
+                "target_p10", "target_p50", "target_p90",
+        ):
+            assert f"budget_{level}_{name}" in budget_summary
     for losses_for_target in (losses_a, losses_b):
         assert model.budget_l5_min <= float(losses_for_target["budget_l5_target"])
         assert float(losses_for_target["budget_l5_target"]) <= model.budget_l5_max
@@ -521,12 +712,21 @@ def uahs_training_and_no_gt_leak_test():
         retain_graph=True
     )
     assert_gradient("budget L4", model.budget_head_l4)
+    assert_gradient(
+        "budget L4 distribution output",
+        model.budget_head_l4.global_mlp,
+    )
     assert_gradient("budget L5", model.budget_head_l5)
     assert all(
         parameter.grad is None
         for module in (model.uncertainty_head_l4, model.uncertainty_head_l5)
         for parameter in module.parameters()
     ), "budget loss unexpectedly updated an uncertainty head"
+    assert all(
+        parameter.grad is None
+        for name, parameter in model.named_parameters()
+        if not name.startswith(("budget_head_l4.", "budget_head_l5."))
+    ), "budget losses unexpectedly updated a non-budget module"
     model.zero_grad(set_to_none=True)
     total_loss = outputs["saliency"].mean()
     for name, value in losses.items():
@@ -570,11 +770,14 @@ def baseline_regression_test():
 
 def main():
     tie_aware_spearman_test()
+    budget_regression_metrics_test()
+    distribution_budget_head_test()
     hierarchy_and_budget_test()
     sparse_attention_equivalence_test()
     global_attention_test()
     warmup_randomness_test()
     legacy_budget_checkpoint_test()
+    distribution_budget_checkpoint_test()
     sparse_scatter_reconstruction_test()
     evaluation_ablation_test()
     uahs_training_and_no_gt_leak_test()

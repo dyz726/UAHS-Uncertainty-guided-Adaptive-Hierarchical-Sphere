@@ -180,3 +180,58 @@ def per_frame_spearman(first, second, epsilon=1e-8):
     return torch.where(
         defined, correlation.clamp(-1, 1), torch.full_like(correlation, float("nan"))
     )
+
+
+@torch.no_grad()
+def budget_regression_metrics(prediction, target, epsilon=1e-12):
+    """Summarize paired per-frame budget predictions and targets."""
+    if prediction.numel() != target.numel():
+        raise ValueError("prediction and target must contain the same number of values")
+    prediction = prediction.detach().reshape(-1).to(dtype=torch.float64)
+    target = target.detach().reshape(-1).to(
+        device=prediction.device, dtype=torch.float64
+    )
+    finite = torch.isfinite(prediction) & torch.isfinite(target)
+    prediction, target = prediction[finite], target[finite]
+    if prediction.numel() == 0:
+        raise ValueError("budget diagnostics require at least one finite pair")
+
+    difference = prediction - target
+    centered_prediction = prediction - prediction.mean()
+    centered_target = target - target.mean()
+    pearson_denominator = torch.sqrt(
+        centered_prediction.square().sum() * centered_target.square().sum()
+    )
+    if float(pearson_denominator) <= epsilon:
+        pearson = float("nan")
+    else:
+        pearson = float(
+            (centered_prediction * centered_target).sum()
+            / pearson_denominator
+        )
+    spearman = float(per_frame_spearman(
+        prediction.unsqueeze(0), target.unsqueeze(0), epsilon=epsilon
+    ).squeeze(0))
+    quantiles = prediction.new_tensor((0.1, 0.5, 0.9))
+    prediction_quantiles = torch.quantile(prediction, quantiles)
+    target_quantiles = torch.quantile(target, quantiles)
+
+    return {
+        "pred_mean": float(prediction.mean()),
+        "pred_std": float(prediction.std(unbiased=False)),
+        "target_mean": float(target.mean()),
+        "target_std": float(target.std(unbiased=False)),
+        "mae": float(difference.abs().mean()),
+        "rmse": float(difference.square().mean().sqrt()),
+        "pearson": pearson,
+        "spearman": spearman,
+        "under_budget_ratio": float((prediction < target).to(torch.float64).mean()),
+        "pred_p10": float(prediction_quantiles[0]),
+        "pred_p50": float(prediction_quantiles[1]),
+        "pred_p90": float(prediction_quantiles[2]),
+        "target_p10": float(target_quantiles[0]),
+        "target_p50": float(target_quantiles[1]),
+        "target_p90": float(target_quantiles[2]),
+        "finite_count": int(prediction.numel()),
+        "nonfinite_count": int((~finite).sum()),
+    }
