@@ -28,6 +28,31 @@ from .sphere_PSA import (
 )
 
 
+def classify_budget_head_checkpoint(source_keys, head_name):
+    """Classify one budget head without accepting partial current state."""
+    prefix = f"{head_name}."
+    head_keys = {key for key in source_keys if key.startswith(prefix)}
+    if not head_keys:
+        return "missing"
+    current_keys = {
+        f"{head_name}.beta",
+        f"{head_name}.raw_temperature",
+    }
+    current_present = head_keys & current_keys
+    if current_present == current_keys:
+        return "current"
+    if current_present:
+        return "incomplete"
+    legacy_prefixes = (
+        f"{head_name}.mlp.",
+        f"{head_name}.face_mlp.",
+        f"{head_name}.global_mlp.",
+    )
+    if all(key.startswith(legacy_prefixes) for key in head_keys):
+        return "legacy"
+    return "unknown"
+
+
 class HardAreaSelector(nn.Module):
     """Non-differentiable, spherical-area-aware hard face selector."""
 
@@ -53,51 +78,87 @@ class HardAreaSelector(nn.Module):
         )
 
 
-class DynamicBudgetHead(nn.Module):
-    """Predict a per-frame budget from detached uncertainty mean/std."""
+class CalibratedLaplaceRiskHead(nn.Module):
+    """Calibrate local Laplace exceedance risk and integrate its sphere area."""
 
     def __init__(
             self,
             initial_output: float,
+            error_threshold: float,
             output_min: float = 0.0,
             output_max: float = 1.0,
-            hidden_dim: int = 8,
+            epsilon: float = 1e-6,
     ):
         super().__init__()
         if not 0 <= output_min < output_max <= 1:
             raise ValueError("Expected 0 <= output_min < output_max <= 1")
         if not output_min <= initial_output <= output_max:
             raise ValueError("initial_output must be inside the output range")
+        if error_threshold <= 0:
+            raise ValueError("error_threshold must be positive")
+        if epsilon <= 0:
+            raise ValueError("epsilon must be positive")
+        self.error_threshold = float(error_threshold)
+        self.initial_output = float(initial_output)
         self.output_min = float(output_min)
         self.output_max = float(output_max)
-        self.initial_output = float(initial_output)
-        self.mlp = nn.Sequential(
-            nn.Linear(2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
+        self.epsilon = float(epsilon)
+        self.beta = nn.Parameter(torch.empty(()))
+        self.raw_temperature = nn.Parameter(torch.empty(()))
+        self.reset_output()
 
+    @torch.no_grad()
+    def reset_identity(self):
+        """Use the unmodified Laplace exceedance probability."""
+        self.beta.zero_()
+        temperature = 1.0 - self.epsilon
+        self.raw_temperature.fill_(math.log(math.expm1(temperature)))
+
+    @torch.no_grad()
     def reset_output(self):
-        """Start at the configured budget while retaining trainability."""
-        final = self.mlp[-1]
-        nn.init.zeros_(final.weight)
-        normalized = (
-            (self.initial_output - self.output_min)
-            / (self.output_max - self.output_min)
+        """Match the configured budget at the uncertainty head's initial scale."""
+        self.reset_identity()
+        reference_scale = math.log(2.0) + self.epsilon
+        reference_probability = math.exp(
+            -self.error_threshold / (reference_scale + self.epsilon)
         )
-        normalized = min(max(normalized, 1e-4), 1 - 1e-4)
-        nn.init.constant_(final.bias, math.log(normalized / (1 - normalized)))
+        reference_probability = min(
+            max(reference_probability, self.epsilon), 1.0 - self.epsilon
+        )
+        target = min(
+            max(self.initial_output, self.epsilon), 1.0 - self.epsilon
+        )
+        reference_logit = math.log(
+            reference_probability / (1.0 - reference_probability)
+        )
+        target_logit = math.log(target / (1.0 - target))
+        self.beta.fill_(target_logit - reference_logit)
+
+    @property
+    def temperature(self) -> Tensor:
+        return F.softplus(self.raw_temperature) + self.epsilon
 
     def forward(
             self,
             uncertainty: Tensor,
             face_areas: Tensor,
             eligible_mask: Optional[Tensor] = None,
-    ) -> Tensor:
+    ):
         if uncertainty.shape[-1] != face_areas.numel():
             raise ValueError("uncertainty and face_areas have different counts")
-        # Budget supervision must never reshape the uncertainty representation.
+        # Risk/budget losses calibrate only this head, never uncertainty itself.
         uncertainty = uncertainty.detach()
+        probability = torch.exp(
+            -self.error_threshold
+            / (uncertainty.clamp_min(0) + self.epsilon)
+        )
+        probability = probability.clamp(
+            min=self.epsilon, max=1.0 - self.epsilon
+        )
+        log_odds = torch.log(probability) - torch.log1p(-probability)
+        local_risk = torch.sigmoid(
+            (log_odds + self.beta) / self.temperature
+        )
         areas = face_areas.to(
             device=uncertainty.device, dtype=uncertainty.dtype
         )
@@ -109,96 +170,12 @@ class DynamicBudgetHead(nn.Module):
         denominator = weights.sum(dim=-1).clamp_min(
             torch.finfo(uncertainty.dtype).eps
         )
-        mean = (uncertainty * weights).sum(dim=-1) / denominator
-        variance = (
-            (uncertainty - mean.unsqueeze(-1)).square() * weights
-        ).sum(dim=-1) / denominator
-        statistics = torch.stack((mean, variance.clamp_min(0).sqrt()), dim=-1)
-        unit_budget = torch.sigmoid(self.mlp(statistics).squeeze(-1))
-        return self.output_min + (
-            self.output_max - self.output_min
-        ) * unit_budget
-
-
-class DistributionBudgetHead(nn.Module):
-    """Predict a budget from an area-weighted uncertainty distribution."""
-
-    def __init__(
-            self,
-            initial_output: float,
-            output_min: float = 0.0,
-            output_max: float = 1.0,
-            hidden_dim: int = 8,
-            distribution_dim: int = 8,
-            epsilon: float = 1e-6,
-    ):
-        super().__init__()
-        if not 0 <= output_min < output_max <= 1:
-            raise ValueError("Expected 0 <= output_min < output_max <= 1")
-        if not output_min <= initial_output <= output_max:
-            raise ValueError("initial_output must be inside the output range")
-        if distribution_dim <= 0:
-            raise ValueError("distribution_dim must be positive")
-        if epsilon <= 0:
-            raise ValueError("epsilon must be positive")
-        self.output_min = float(output_min)
-        self.output_max = float(output_max)
-        self.initial_output = float(initial_output)
-        self.distribution_dim = int(distribution_dim)
-        self.epsilon = float(epsilon)
-        self.face_mlp = nn.Sequential(
-            nn.Linear(1, self.distribution_dim),
-            nn.GELU(),
-            nn.Linear(self.distribution_dim, self.distribution_dim),
-            nn.GELU(),
+        budget = (
+            (local_risk * weights).sum(dim=-1) / denominator
+        ).clamp(
+            min=self.output_min, max=self.output_max
         )
-        self.global_mlp = nn.Sequential(
-            nn.Linear(self.distribution_dim + 2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def reset_output(self):
-        """Initialize the head at its configured constant operating point."""
-        final = self.global_mlp[-1]
-        nn.init.zeros_(final.weight)
-        normalized = (
-            (self.initial_output - self.output_min)
-            / (self.output_max - self.output_min)
-        )
-        normalized = min(max(normalized, 1e-4), 1 - 1e-4)
-        nn.init.constant_(final.bias, math.log(normalized / (1 - normalized)))
-
-    def forward(self, uncertainty: Tensor, face_areas: Tensor) -> Tensor:
-        if uncertainty.shape[-1] != face_areas.numel():
-            raise ValueError("uncertainty and face_areas have different counts")
-        uncertainty = uncertainty.detach()
-        areas = face_areas.to(
-            device=uncertainty.device, dtype=uncertainty.dtype
-        )
-        weights = areas.reshape(*([1] * (uncertainty.ndim - 1)), -1)
-        denominator = weights.sum(dim=-1).clamp_min(
-            torch.finfo(uncertainty.dtype).eps
-        )
-
-        mean = (uncertainty * weights).sum(dim=-1) / denominator
-        variance = (
-            (uncertainty - mean.unsqueeze(-1)).square() * weights
-        ).sum(dim=-1) / denominator
-        statistics = torch.stack((mean, variance.clamp_min(0).sqrt()), dim=-1)
-        face_features = self.face_mlp(
-            torch.log(uncertainty.clamp_min(0) + self.epsilon).unsqueeze(-1)
-        )
-        pooled_features = (
-            face_features * weights.unsqueeze(-1)
-        ).sum(dim=-2) / denominator.unsqueeze(-1)
-        global_features = torch.cat((pooled_features, statistics), dim=-1)
-        unit_budget = torch.sigmoid(
-            self.global_mlp(global_features).squeeze(-1)
-        )
-        return self.output_min + (
-            self.output_max - self.output_min
-        ) * unit_budget
+        return budget, local_risk
 
 
 class UAHS(nn.Module):
@@ -250,6 +227,8 @@ class UAHS(nn.Module):
             target_refine_ratio_l2: float = 0.125,
             budget_l5_min: float = 0.05,
             budget_l5_max: float = 0.50,
+            budget_error_threshold_l4: float = 0.05,
+            budget_error_threshold_l5: float = 0.05,
             global_query_chunk_size: int = 128,
             hard_selection_warmup_epochs: int = 0,
             return_aux: bool = False,
@@ -400,13 +379,15 @@ class UAHS(nn.Module):
         self.saliency_head_l5 = nn.Linear(embed_dim, out_channels)
         self.uncertainty_head_l4 = SphericalUncertaintyHead(embed_dim)
         self.uncertainty_head_l5 = SphericalUncertaintyHead(embed_dim)
-        self.budget_head_l4 = DistributionBudgetHead(
+        self.budget_head_l4 = CalibratedLaplaceRiskHead(
             initial_output=target_refine_ratio_l1,
+            error_threshold=budget_error_threshold_l4,
             output_min=budget_l5_min,
             output_max=budget_l5_max,
         )
-        self.budget_head_l5 = DynamicBudgetHead(
+        self.budget_head_l5 = CalibratedLaplaceRiskHead(
             initial_output=target_refine_ratio_l2 / target_refine_ratio_l1,
+            error_threshold=budget_error_threshold_l5,
         )
         self.hard_selector_l4 = HardAreaSelector(target_refine_ratio_l1)
         self.hard_selector_l5 = HardAreaSelector(target_refine_ratio_l2)
@@ -415,10 +396,6 @@ class UAHS(nn.Module):
         self.output_proj = OutputProj(embed_dim, out_channels)
         self.final_sigmoid = nn.Sigmoid()
         self.apply(self._init_weights)
-        # ``apply`` initializes every Linear first; restore the configured
-        # initial budgets last (0.25 / 0.125 with the default arguments).
-        self.budget_head_l4.reset_output()
-        self.budget_head_l5.reset_output()
 
     def set_epoch(self, epoch: int):
         self.current_epoch = int(epoch)
@@ -553,7 +530,7 @@ class UAHS(nn.Module):
         """Predict saliency without labels; overrides are evaluation-only masks.
 
         ``disable_l6_refinement`` is an evaluation-only ablation. It preserves
-        the uncertainty-based L4/L5 routing, dense L5 representation, L5->L6 base
+        the risk-based L4/L5 routing, dense L5 representation, L5->L6 base
         reconstruction, fusion normalization, and final output head, while
         skipping only the selected-query rank-6 residual computation.
         """
@@ -595,12 +572,12 @@ class UAHS(nn.Module):
             self.saliency_head_l4(face_l4).squeeze(-1)
         )
         uncertainty_l4 = self.uncertainty_head_l4(face_l4)
-        budget_l5_pred = self.budget_head_l4(
+        budget_l5_pred, refinement_risk_l4 = self.budget_head_l4(
             uncertainty_l4, self.hierarchy_l4_l5.coarse_face_areas
         )
         score_l4 = self._selection_scores(
             selector_mode,
-            uncertainty_l4,
+            refinement_risk_l4,
             saliency_l4,
             selector_seed,
         )
@@ -658,7 +635,7 @@ class UAHS(nn.Module):
         )
         uncertainty_l5 = self.uncertainty_head_l5(face_l5)
         eligible_l5 = child_faces_l5.bool()
-        budget_l6_alpha = self.budget_head_l5(
+        budget_l6_alpha, refinement_risk_l5 = self.budget_head_l5(
             uncertainty_l5,
             self.hierarchy_l5_l6.coarse_face_areas,
             eligible_mask=eligible_l5,
@@ -669,7 +646,7 @@ class UAHS(nn.Module):
         budget_l6_pred = selected_area_l1.detach() * budget_l6_alpha
         score_l5 = self._selection_scores(
             selector_mode,
-            uncertainty_l5,
+            refinement_risk_l5,
             saliency_l5,
             selector_seed + 1,
         )
@@ -793,11 +770,13 @@ class UAHS(nn.Module):
             "saliency": saliency,
             "saliency_l4": saliency_l4,
             "uncertainty_l4": uncertainty_l4,
+            "refinement_risk_l4": refinement_risk_l4,
             "budget_l5_pred": budget_l5_pred,
             "hard_face_mask_l4": hard_l4,
             "selected_area_l1": selected_area_l1,
             "saliency_l5": saliency_l5,
             "uncertainty_l5": uncertainty_l5,
+            "refinement_risk_l5": refinement_risk_l5,
             "budget_l6_alpha": budget_l6_alpha,
             "budget_l6_pred": budget_l6_pred,
             "eligible_face_mask_l5": eligible_l5,

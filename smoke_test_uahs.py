@@ -14,7 +14,7 @@ from adaptive_objectives import (
 )
 from inference import InferenceRunner
 from network.sphere_model import build_saliency_model
-from network.uahs import DistributionBudgetHead, DynamicBudgetHead
+from network.uahs import CalibratedLaplaceRiskHead
 from network.sphere_PSA import (
     GlobalSphereSelfAttention,
     SparseSphereSelfAttention,
@@ -110,66 +110,77 @@ def budget_regression_metrics_test():
     print("per-frame budget regression diagnostics: OK")
 
 
-def distribution_budget_head_test():
-    """Verify distribution sensitivity, area pooling, and gradient isolation."""
+def calibrated_laplace_risk_head_test():
+    """Verify Laplace risk, area integration, monotonicity, and detach."""
     torch.manual_seed(7)
-    head = DistributionBudgetHead(
+    head = CalibratedLaplaceRiskHead(
         initial_output=0.25,
+        error_threshold=0.05,
         output_min=0.05,
         output_max=0.50,
-        hidden_dim=4,
-        distribution_dim=4,
     )
-    head.reset_output()
-    initial = head(torch.rand(2, 4), torch.ones(4))
-    assert torch.allclose(initial, torch.full((2,), 0.25), atol=1e-6)
-
-    with torch.no_grad():
-        head.global_mlp[-1].weight.fill_(0.2)
-    first = torch.tensor([[1.0, 1.0, 3.0, 3.0]])
-    second = torch.tensor([[
-        2 - 2 ** 0.5, 2.0, 2.0, 2 + 2 ** 0.5,
-    ]])
-    uncertainty = torch.cat((first, second), dim=0).requires_grad_(True)
+    initial_uncertainty = torch.full(
+        (2, 4), float(torch.log(torch.tensor(2.0))) + head.epsilon
+    )
+    initial_budget, _ = head(initial_uncertainty, torch.ones(4))
+    assert torch.allclose(
+        initial_budget, torch.full((2,), 0.25), atol=1e-6
+    )
+    head.reset_identity()
+    uncertainty = torch.tensor([
+        [0.01, 0.03, 0.06, 0.12],
+        [0.02, 0.04, 0.08, 0.16],
+    ], requires_grad=True)
     areas = torch.tensor([0.5, 1.0, 1.5, 2.0])
-    output = head(uncertainty, areas)
+    budget, risk = head(uncertainty, areas)
 
     weights = areas.reshape(1, -1)
     denominator = weights.sum(dim=-1)
-    mean = (uncertainty.detach() * weights).sum(dim=-1) / denominator
-    variance = (
-        (uncertainty.detach() - mean.unsqueeze(-1)).square() * weights
-    ).sum(dim=-1) / denominator
-    statistics = torch.stack((mean, variance.sqrt()), dim=-1)
-    face_features = head.face_mlp(
-        torch.log(uncertainty.detach() + head.epsilon).unsqueeze(-1)
+    expected_risk = torch.exp(
+        -head.error_threshold / (uncertainty.detach() + head.epsilon)
     )
-    pooled = (
-        face_features * weights.unsqueeze(-1)
-    ).sum(dim=-2) / denominator.unsqueeze(-1)
-    expected_logits = head.global_mlp(
-        torch.cat((pooled, statistics), dim=-1)
-    ).squeeze(-1)
-    expected = head.output_min + (head.output_max - head.output_min) * torch.sigmoid(
-        expected_logits
-    )
-    assert torch.allclose(output, expected, atol=1e-7)
+    expected_budget = (
+        (expected_risk * weights).sum(dim=-1) / denominator
+    ).clamp(head.output_min, head.output_max)
+    assert torch.allclose(head.temperature, torch.tensor(1.0), atol=1e-6)
+    assert torch.allclose(risk, expected_risk, atol=1e-6)
+    assert torch.allclose(budget, expected_budget, atol=1e-6)
+    assert bool((risk[:, 1:] > risk[:, :-1]).all())
 
     permutation = torch.tensor([2, 0, 3, 1])
-    permuted = head(uncertainty[:, permutation], areas[permutation])
-    assert torch.allclose(output, permuted, atol=1e-7)
-    equal_areas = torch.ones(4)
-    assert torch.allclose(first.mean(), second.mean(), atol=1e-6)
-    assert torch.allclose(first.std(unbiased=False), second.std(unbiased=False), atol=1e-6)
-    distribution_outputs = head(torch.cat((first, second)), equal_areas)
-    assert not torch.allclose(distribution_outputs[0], distribution_outputs[1])
+    permuted_budget, permuted_risk = head(
+        uncertainty[:, permutation], areas[permutation]
+    )
+    assert torch.allclose(budget, permuted_budget, atol=1e-7)
+    assert torch.allclose(risk[:, permutation], permuted_risk, atol=1e-7)
 
-    output.sum().backward()
+    eligible = torch.tensor([
+        [True, False, True, False],
+        [False, True, True, True],
+    ])
+    conditional_head = CalibratedLaplaceRiskHead(
+        initial_output=0.5,
+        error_threshold=0.05,
+        output_min=0.0,
+        output_max=1.0,
+    )
+    conditional_head.reset_identity()
+    conditional_budget, conditional_risk = conditional_head(
+        uncertainty, areas, eligible_mask=eligible
+    )
+    eligible_weights = weights * eligible
+    expected_conditional = (
+        (expected_risk * eligible_weights).sum(dim=-1)
+        / eligible_weights.sum(dim=-1)
+    )
+    assert torch.allclose(conditional_risk, expected_risk, atol=1e-6)
+    assert torch.allclose(conditional_budget, expected_conditional, atol=1e-6)
+
+    (budget.sum() + risk.mean()).backward()
     assert uncertainty.grad is None
-    assert_gradient("distribution budget head", head)
-    assert_gradient("distribution face encoder", head.face_mlp)
-    assert_gradient("distribution global encoder", head.global_mlp)
-    print("area-weighted distribution budget head and detached input: OK")
+    assert_gradient("calibrated Laplace risk head", head)
+    assert sum(parameter.numel() for parameter in head.parameters()) == 2
+    print("calibrated Laplace local risk and spherical integration: OK")
 
 
 def hierarchy_and_budget_test():
@@ -333,7 +344,7 @@ def warmup_randomness_test():
 
 
 def legacy_budget_checkpoint_test():
-    """Missing dynamic heads must retain the legacy operating point."""
+    """Missing dynamic heads must retain their safe initial calibration."""
     source = build_saliency_model(model_args("uahs", img_rank=3))
     legacy_state = {
         name: value
@@ -350,81 +361,115 @@ def legacy_budget_checkpoint_test():
     )
     with torch.no_grad():
         outputs = restored(torch.randn(1, 1, 642, 3), return_aux=True)
+        expected_budget, expected_risk = restored.budget_head_l4(
+            outputs["uncertainty_l4"],
+            restored.hierarchy_l4_l5.coarse_face_areas,
+        )
+    assert torch.allclose(outputs["budget_l5_pred"], expected_budget)
     assert torch.allclose(
-        outputs["budget_l5_pred"], torch.tensor([[0.25]]), atol=1e-6
+        outputs["refinement_risk_l4"], expected_risk
     )
-    assert torch.allclose(outputs["budget_l6_alpha"], torch.tensor([[0.5]]))
     assert torch.allclose(
-        outputs["budget_l6_pred"], outputs["selected_area_l1"] * 0.5
+        restored.budget_head_l4.temperature, torch.tensor(1.0), atol=1e-6
     )
-    print("legacy checkpoint dynamic-budget initialization: OK")
+    expected_alpha, expected_risk_l5 = restored.budget_head_l5(
+        outputs["uncertainty_l5"],
+        restored.hierarchy_l5_l6.coarse_face_areas,
+        eligible_mask=outputs["eligible_face_mask_l5"],
+    )
+    assert torch.allclose(outputs["budget_l6_alpha"], expected_alpha)
+    assert torch.allclose(
+        outputs["refinement_risk_l5"], expected_risk_l5
+    )
+    assert torch.allclose(
+        outputs["budget_l6_pred"], outputs["selected_area_l1"] * expected_alpha
+    )
+    assert abs(float(outputs["budget_l5_pred"].mean()) - 0.25) < 0.01
+    assert abs(float(outputs["budget_l6_alpha"].mean()) - 0.5) < 0.01
+    assert abs(float(outputs["budget_l6_pred"].mean()) - 0.125) < 0.01
+    print("configured 0.25/0.125 startup budgets: OK")
 
 
-def distribution_budget_checkpoint_test():
-    """An old L5 mean/std head is replaced, while compatible weights load."""
+def calibrated_risk_checkpoint_test():
+    """Earlier budget heads are replaced while all other weights load."""
+    def assert_identity_calibration(model):
+        for head in (model.budget_head_l4, model.budget_head_l5):
+            assert torch.allclose(head.beta, torch.tensor(0.0))
+            assert torch.allclose(
+                head.temperature, torch.tensor(1.0), atol=1e-6
+            )
+
     torch.manual_seed(23)
     source = build_saliency_model(model_args("uahs", img_rank=3)).eval()
-    old_l5_head = DynamicBudgetHead(
-        initial_output=0.25,
-        output_min=0.05,
-        output_max=0.50,
-    )
-    old_l5_head.reset_output()
     with torch.no_grad():
-        source.budget_head_l5.mlp[0].weight.normal_()
-        source.budget_head_l5.mlp[2].weight.normal_()
-        source.budget_head_l5.mlp[2].bias.fill_(-0.3)
+        source.budget_head_l4.beta.fill_(0.2)
+        source.budget_head_l5.beta.fill_(-0.3)
     old_dynamic_state = {
         name: value
         for name, value in source.state_dict().items()
-        if not name.startswith("budget_head_l4.")
+        if not name.startswith(("budget_head_l4.", "budget_head_l5."))
     }
-    old_dynamic_state.update({
-        f"budget_head_l4.{name}": value
-        for name, value in old_l5_head.state_dict().items()
-    })
+    old_dynamic_state["budget_head_l4.face_mlp.0.weight"] = torch.randn(4, 1)
+    old_dynamic_state["budget_head_l4.global_mlp.2.bias"] = torch.randn(1)
+    old_dynamic_state["budget_head_l5.mlp.0.weight"] = torch.randn(8, 2)
+    old_dynamic_state["budget_head_l5.mlp.2.bias"] = torch.randn(1)
     restored = build_saliency_model(model_args("uahs", img_rank=3)).eval()
-    initial_l5_state = {
-        name: value.clone()
-        for name, value in restored.budget_head_l4.state_dict().items()
-    }
     with tempfile.NamedTemporaryFile(suffix=".pth") as checkpoint:
         torch.save(old_dynamic_state, checkpoint.name)
         Trainer.load_pretrained(
             Trainer.__new__(Trainer), restored, checkpoint.name
         )
+        assert_identity_calibration(restored)
         inference_model = build_saliency_model(
             model_args("uahs", img_rank=3)
         ).eval()
-        initial_inference_l5 = {
-            name: value.clone()
-            for name, value in inference_model.budget_head_l4.state_dict().items()
-        }
         inference_runner = InferenceRunner.__new__(InferenceRunner)
         inference_runner.model = inference_model
         inference_runner._load_weights(checkpoint.name)
-        for name, value in inference_model.budget_head_l4.state_dict().items():
-            assert torch.equal(value, initial_inference_l5[name])
+        assert_identity_calibration(inference_model)
 
         torch.save(source.state_dict(), checkpoint.name)
         inference_runner._load_weights(checkpoint.name)
         for name, value in inference_model.state_dict().items():
             assert torch.equal(value, source.state_dict()[name])
-    for name, value in restored.budget_head_l4.state_dict().items():
-        assert torch.equal(value, initial_l5_state[name])
-    for name, value in restored.budget_head_l5.state_dict().items():
-        assert torch.equal(
-            value, source.budget_head_l5.state_dict()[name]
+
+        partial_state = dict(source.state_dict())
+        del partial_state["budget_head_l4.raw_temperature"]
+        torch.save(partial_state, checkpoint.name)
+        partial_training_model = build_saliency_model(
+            model_args("uahs", img_rank=3)
         )
+        try:
+            Trainer.load_pretrained(
+                Trainer.__new__(Trainer),
+                partial_training_model,
+                checkpoint.name,
+            )
+        except RuntimeError as error:
+            assert "Incomplete" in str(error)
+        else:
+            raise AssertionError("Training accepted an incomplete risk head")
+        partial_inference = InferenceRunner.__new__(InferenceRunner)
+        partial_inference.model = build_saliency_model(
+            model_args("uahs", img_rank=3)
+        )
+        try:
+            partial_inference._load_weights(checkpoint.name)
+        except RuntimeError as error:
+            assert "Incomplete" in str(error)
+        else:
+            raise AssertionError("Inference accepted an incomplete risk head")
+
     with torch.no_grad():
-        prediction = restored.budget_head_l4(
+        prediction, risk = restored.budget_head_l4(
             torch.rand(1, 2, 80), torch.ones(80)
         )
-    assert torch.allclose(prediction, torch.full_like(prediction, 0.25))
+    assert tuple(prediction.shape) == (1, 2)
+    assert tuple(risk.shape) == (1, 2, 80)
     incompatible = restored.load_state_dict(source.state_dict(), strict=True)
     assert not incompatible.missing_keys
     assert not incompatible.unexpected_keys
-    print("old L5 mean/std checkpoint cleanly initializes DeepSets head: OK")
+    print("legacy migration and incomplete risk checkpoint rejection: OK")
 
 
 def sparse_scatter_reconstruction_test():
@@ -491,16 +536,16 @@ def uahs_training_and_no_gt_leak_test():
     torch.manual_seed(1)
     args = model_args("uahs", img_rank=3)
     model = build_saliency_model(args)
-    assert isinstance(model.budget_head_l4, DistributionBudgetHead)
-    assert isinstance(model.budget_head_l5, DynamicBudgetHead)
+    assert isinstance(model.budget_head_l4, CalibratedLaplaceRiskHead)
+    assert isinstance(model.budget_head_l5, CalibratedLaplaceRiskHead)
     assert not hasattr(model.budget_head_l4, "mlp")
-    assert not hasattr(model.budget_head_l5, "face_mlp")
+    assert not hasattr(model.budget_head_l5, "mlp")
     assert sum(
         parameter.numel() for parameter in model.budget_head_l4.parameters()
-    ) == 185
+    ) == 2
     assert sum(
         parameter.numel() for parameter in model.budget_head_l5.parameters()
-    ) == 33
+    ) == 2
     inputs = torch.randn(1, 2, 642, 3)
     model.eval()
     first = model(inputs, return_aux=True)
@@ -511,7 +556,9 @@ def uahs_training_and_no_gt_leak_test():
     forward_keys = (
         "saliency",
         "uncertainty_l4",
+        "refinement_risk_l4",
         "uncertainty_l5",
+        "refinement_risk_l5",
         "hard_face_mask_l4",
         "hard_face_mask_l5_effective",
     )
@@ -556,10 +603,12 @@ def uahs_training_and_no_gt_leak_test():
         "saliency": (1, 2, 642),
         "saliency_l4": (1, 2, 80),
         "uncertainty_l4": (1, 2, 80),
+        "refinement_risk_l4": (1, 2, 80),
         "budget_l5_pred": (1, 2),
         "hard_face_mask_l4": (1, 2, 80),
         "saliency_l5": (1, 2, 320),
         "uncertainty_l5": (1, 2, 320),
+        "refinement_risk_l5": (1, 2, 320),
         "budget_l6_alpha": (1, 2),
         "budget_l6_pred": (1, 2),
         "hard_face_mask_l5_effective": (1, 2, 320),
@@ -617,6 +666,20 @@ def uahs_training_and_no_gt_leak_test():
         "budget_l5_target_per_frame",
         "budget_l6_pred_per_frame",
         "budget_l6_target_per_frame",
+        "risk_l5_pred",
+        "risk_l5_target",
+        "risk_l5_brier",
+        "risk_l5_ece",
+        "risk_l5_beta",
+        "risk_l5_temperature",
+        "budget_l5_consistency",
+        "risk_l6_pred",
+        "risk_l6_target",
+        "risk_l6_brier",
+        "risk_l6_ece",
+        "risk_l6_beta",
+        "risk_l6_temperature",
+        "budget_l6_consistency",
     }
     assert not torch.equal(losses_a["loss_uncertainty_l4"], losses_b["loss_uncertainty_l4"])
     for name in (
@@ -680,15 +743,37 @@ def uahs_training_and_no_gt_leak_test():
     model.train()
     outputs = model(inputs, return_aux=True)
     losses = trainer.compute_uahs_losses(ground_truth_a, outputs)
+    expected_budget, expected_risk = model.budget_head_l4(
+        outputs["uncertainty_l4"],
+        model.hierarchy_l4_l5.coarse_face_areas,
+    )
+    assert torch.allclose(outputs["budget_l5_pred"], expected_budget)
+    assert torch.allclose(outputs["refinement_risk_l4"], expected_risk)
+    expected_alpha, expected_risk_l6 = model.budget_head_l5(
+        outputs["uncertainty_l5"],
+        model.hierarchy_l5_l6.coarse_face_areas,
+        eligible_mask=outputs["eligible_face_mask_l5"],
+    )
+    assert torch.allclose(outputs["budget_l6_alpha"], expected_alpha)
+    assert torch.allclose(outputs["refinement_risk_l5"], expected_risk_l6)
     assert torch.allclose(
-        outputs["budget_l5_pred"], torch.full((1, 2), 0.25), atol=1e-6
+        outputs["budget_l6_pred"],
+        outputs["selected_area_l1"] * expected_alpha,
+    )
+    areas_l5 = model.hierarchy_l5_l6.coarse_face_areas
+    eligible_weights = (
+        outputs["eligible_face_mask_l5"].to(areas_l5.dtype)
+        * areas_l5.reshape(1, 1, -1)
+    )
+    eligible_area = eligible_weights.sum(dim=-1) / areas_l5.sum()
+    direct_risk_area = (
+        outputs["refinement_risk_l5"] * eligible_weights
+    ).sum(dim=-1) / areas_l5.sum()
+    assert torch.allclose(
+        outputs["selected_area_l1"], eligible_area, atol=1e-6
     )
     assert torch.allclose(
-        outputs["budget_l6_alpha"], torch.full((1, 2), 0.5), atol=1e-6
-    )
-    assert torch.allclose(
-        outputs["budget_l6_pred"], outputs["selected_area_l1"] * 0.5,
-        atol=1e-6,
+        outputs["budget_l6_pred"], direct_risk_area, atol=1e-6
     )
     assert bool((
         outputs["budget_l6_pred"] <= outputs["selected_area_l1"]
@@ -712,10 +797,6 @@ def uahs_training_and_no_gt_leak_test():
         retain_graph=True
     )
     assert_gradient("budget L4", model.budget_head_l4)
-    assert_gradient(
-        "budget L4 distribution output",
-        model.budget_head_l4.global_mlp,
-    )
     assert_gradient("budget L5", model.budget_head_l5)
     assert all(
         parameter.grad is None
@@ -771,13 +852,13 @@ def baseline_regression_test():
 def main():
     tie_aware_spearman_test()
     budget_regression_metrics_test()
-    distribution_budget_head_test()
+    calibrated_laplace_risk_head_test()
     hierarchy_and_budget_test()
     sparse_attention_equivalence_test()
     global_attention_test()
     warmup_randomness_test()
     legacy_budget_checkpoint_test()
-    distribution_budget_checkpoint_test()
+    calibrated_risk_checkpoint_test()
     sparse_scatter_reconstruction_test()
     evaluation_ablation_test()
     uahs_training_and_no_gt_leak_test()

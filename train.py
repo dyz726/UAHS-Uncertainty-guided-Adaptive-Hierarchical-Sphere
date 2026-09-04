@@ -213,7 +213,7 @@ if __name__ == "__main__":
     --train_batch_size 1 \
     --val_batch_size 1 \
     --num_workers 8 \
-    --num_epochs 60 \
+    --num_epochs 100 \
     --optimizer adamw \
     --learning_rate 1e-4 \
     --min_learning_rate 1e-6 \
@@ -224,6 +224,6 @@ if __name__ == "__main__":
     --accum_grads 1 \
     --exp_name uahs-v3-sports360 \
     --log_dir /home/dyz/PythonProject/Test_Codes/Sampling_test/log/uahs-v3-sports360 \
-    --tensorboard_log_dir /home/dyz/PythonProject/log/tensorboard/uahs
+    --tensorboard_log_dir /home/dyz/PythonProject/log/tensorboard/uahs-3
 
 """

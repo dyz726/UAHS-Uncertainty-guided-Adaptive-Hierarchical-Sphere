@@ -15,6 +15,7 @@ from adaptive_diagnostics import UAHSDiagnosticsAccumulator
 from data.get_saliency_dataloaders import get_dataloaders
 from evaluation import evaluate_saliency_maps_in_folder
 from network.sphere_model import build_saliency_model
+from network.uahs import classify_budget_head_checkpoint
 from Sphere_SalientScore_torch import batch_compute_metrics
 from train import parser
 from trimesh_utils import IcoSphereRef, asSpherical
@@ -90,21 +91,46 @@ class InferenceRunner:
             (key[7:] if key.startswith("module.") else key): value
             for key, value in state_dict.items()
         }
-        model_state = self.model.state_dict()
         source_keys = set(state_dict)
         has_budget_heads = any(
             key.startswith("budget_head_") for key in source_keys
         )
-        has_old_l5_head = any(
-            key.startswith("budget_head_l4.mlp.") for key in source_keys
+        layouts = {
+            name: classify_budget_head_checkpoint(source_keys, name)
+            for name in ("budget_head_l4", "budget_head_l5")
+        }
+        if has_budget_heads:
+            invalid = {
+                name: layout for name, layout in layouts.items()
+                if layout not in {"current", "legacy"}
+            }
+            if invalid:
+                raise RuntimeError(
+                    "Incomplete or unknown dynamic-budget checkpoint state: "
+                    f"{invalid}"
+                )
+        migrated_heads = tuple(
+            name for name, layout in layouts.items() if layout == "legacy"
         )
-        allowed_missing_prefixes = ()
-        allowed_unexpected_prefixes = ()
+        for name in migrated_heads:
+            getattr(self.model, name).reset_identity()
+        model_state = self.model.state_dict()
         if not has_budget_heads:
             allowed_missing_prefixes = ("budget_head_l4.", "budget_head_l5.")
-        elif has_old_l5_head:
-            allowed_missing_prefixes = ("budget_head_l4.",)
-            allowed_unexpected_prefixes = ("budget_head_l4.mlp.",)
+            allowed_unexpected_prefixes = ()
+        else:
+            allowed_missing_prefixes = tuple(
+                f"{name}." for name in migrated_heads
+            )
+            allowed_unexpected_prefixes = tuple(
+                prefix
+                for name in migrated_heads
+                for prefix in (
+                    f"{name}.mlp.",
+                    f"{name}.face_mlp.",
+                    f"{name}.global_mlp.",
+                )
+            )
 
         shape_mismatches = [
             key for key, value in state_dict.items()
@@ -134,14 +160,15 @@ class InferenceRunner:
         self.model.load_state_dict(model_state, strict=True)
         if not has_budget_heads:
             print(
-                "Checkpoint predates dynamic budgets; initialized budget heads "
-                "at the configured 0.25 / 0.125 operating point."
+                "Checkpoint predates dynamic budgets; both risk heads retain "
+                "their configured startup budgets."
             )
-        elif has_old_l5_head:
+        elif migrated_heads:
             print(
-                "Checkpoint uses the former L5 mean/std budget head; its "
-                "weights are ignored and the new DeepSets head retains its "
-                "safe 0.25 initialization."
+                "Checkpoint uses earlier budget heads for "
+                f"{', '.join(migrated_heads)}; their weights are ignored and "
+                "the corresponding Laplace-risk calibration starts at "
+                "beta=0, temperature=1."
             )
         print(f"Loaded {len(compatible_state)} model tensors from {path}")
 
@@ -476,7 +503,7 @@ if __name__ == "__main__":
 CUDA_VISIBLE_DEVICES=3 python /home/dyz/PythonProject/Test_Codes/Sampling_test/inference.py \
     --model_type uahs \
     --dataset_name Sports-360 \
-    --base_model_weights /home/dyz/PythonProject/Test_Codes/Sampling_test/log/uahs-v3-sports360/models/Epoch_30model.pth \
+    --base_model_weights /home/dyz/PythonProject/Test_Codes/Sampling_test/log/uahs-v3-sports360/models/Epoch_27model.pth \
     --output_dir /home/dyz/PythonProject/DataSet_Output/Sports-360 \
     --method_name UAHS \
     --mode vertex \
@@ -491,16 +518,32 @@ CUDA_VISIBLE_DEVICES=3 python /home/dyz/PythonProject/Test_Codes/Sampling_test/i
     --val_batch_size 1 \
     --num_workers 8
 
-Epoch_30model.pth
-Average AUC-J:  0.9387995677737113
-Average NSS:  4.352345161239625
-Average KL Divergence:  1.6327730351383458
-Average SIM:  0.4899660684485185
-Average CC:  0.670838757243907
-========== Sphere Metrics (for comparison) ==========
-AUC: 0.922776
-NSS: 3.646490
-CC: 0.663930
-SIM: 0.490483
-KL: 0.955341
+Epoch_23model.pth
+Average AUC-J:  0.937521769574947
+Average NSS:  4.412018399251346
+Average KL Divergence:  1.7768851609713057
+Average SIM:  0.5015052475896234
+Average CC:  0.6788409644269828
+
+========== Final Sphere Metrics ==========
+AUC: 0.921984
+NSS: 3.695533
+CC: 0.671711
+SIM: 0.501339
+KL: 0.943755
+
+
+动态调整预算大小Epoch_21model.pth
+Average AUC-J:  0.9396596347750381
+Average NSS:  4.5120151906079515
+Average KL Divergence:  1.4603340075494593
+Average SIM:  0.4938410525639292
+Average CC:  0.6852996642027537
+
+========== Final Sphere Metrics ==========
+AUC: 0.922739
+NSS: 3.789492
+CC: 0.678706
+SIM: 0.494472
+KL: 0.931123
 """

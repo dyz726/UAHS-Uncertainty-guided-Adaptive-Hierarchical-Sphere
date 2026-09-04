@@ -843,6 +843,12 @@ def build_saliency_model(args, node_type: Optional[str] = None) -> nn.Module:
         target_refine_ratio_l2=args.target_refine_ratio_l2,
         budget_l5_min=getattr(args, "budget_l5_min", 0.05),
         budget_l5_max=getattr(args, "budget_l5_max", 0.50),
+        budget_error_threshold_l4=getattr(
+            args, "budget_error_threshold_l4", 0.05
+        ),
+        budget_error_threshold_l5=getattr(
+            args, "budget_error_threshold_l5", 0.05
+        ),
         global_query_chunk_size=args.global_query_chunk_size,
         hard_selection_warmup_epochs=args.hard_selection_warmup_epochs,
         return_aux=args.return_aux,

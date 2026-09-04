@@ -4,6 +4,24 @@ import torch
 
 
 @torch.no_grad()
+def build_error_supervised_risk(
+        target,
+        prediction,
+        error_threshold,
+        error_temperature,
+):
+    """Build per-face soft refinement demand from detached prediction error."""
+    if target.shape != prediction.shape:
+        raise ValueError("target and prediction must have identical shapes")
+    if error_temperature <= 0:
+        raise ValueError("error_temperature must be positive")
+    residual = (target - prediction.detach()).abs()
+    return torch.sigmoid(
+        (residual - float(error_threshold)) / float(error_temperature)
+    )
+
+
+@torch.no_grad()
 def build_error_supervised_budget(
         target,
         prediction,
@@ -18,15 +36,13 @@ def build_error_supervised_budget(
     supplied, only eligible faces contribute to the numerator; consequently a
     child-stage target cannot request area outside its parent-stage region.
     """
-    if target.shape != prediction.shape:
-        raise ValueError("target and prediction must have identical shapes")
     if target.shape[-1] != face_areas.numel():
         raise ValueError("target and face_areas have different face counts")
-    if error_temperature <= 0:
-        raise ValueError("error_temperature must be positive")
-    residual = (target - prediction.detach()).abs()
-    demand = torch.sigmoid(
-        (residual - float(error_threshold)) / float(error_temperature)
+    demand = build_error_supervised_risk(
+        target,
+        prediction,
+        error_threshold,
+        error_temperature,
     )
     if eligible_mask is not None:
         if eligible_mask.shape != demand.shape:
@@ -34,6 +50,58 @@ def build_error_supervised_budget(
         demand = demand * eligible_mask.detach().to(demand.dtype)
     areas = face_areas.to(device=demand.device, dtype=demand.dtype)
     return (demand * areas).sum(dim=-1) / areas.sum()
+
+
+@torch.no_grad()
+def area_weighted_calibration_error(
+        prediction,
+        target,
+        face_areas,
+        eligible_mask=None,
+        num_bins=10,
+        epsilon=1e-8,
+):
+    """Return spherical-area-weighted ECE for local refinement risk."""
+    if prediction.shape != target.shape:
+        raise ValueError("prediction and target must have identical shapes")
+    if prediction.shape[-1] != face_areas.numel():
+        raise ValueError("prediction and face_areas have different face counts")
+    if num_bins <= 0:
+        raise ValueError("num_bins must be positive")
+
+    prediction = prediction.detach()
+    target = target.detach().to(
+        device=prediction.device, dtype=prediction.dtype
+    )
+    areas = face_areas.to(device=prediction.device, dtype=prediction.dtype)
+    weights = areas.reshape(*([1] * (prediction.ndim - 1)), -1)
+    weights = weights.expand_as(prediction)
+    if eligible_mask is not None:
+        if eligible_mask.shape != prediction.shape:
+            raise ValueError("eligible_mask must match prediction")
+        weights = weights * eligible_mask.detach().to(weights.dtype)
+    flat_prediction = prediction.reshape(-1)
+    flat_target = target.reshape(-1)
+    flat_weights = weights.reshape(-1)
+    bin_indices = torch.clamp(
+        (prediction.clamp(0, 1) * num_bins).long(),
+        max=num_bins - 1,
+    ).reshape(-1)
+    bin_weights = prediction.new_zeros(num_bins).scatter_add_(
+        0, bin_indices, flat_weights
+    )
+    prediction_totals = prediction.new_zeros(num_bins).scatter_add_(
+        0, bin_indices, flat_prediction * flat_weights
+    )
+    target_totals = prediction.new_zeros(num_bins).scatter_add_(
+        0, bin_indices, flat_target * flat_weights
+    )
+    denominator = bin_weights.clamp_min(epsilon)
+    bin_error = (
+        prediction_totals / denominator - target_totals / denominator
+    ).abs()
+    total_weight = bin_weights.sum().clamp_min(epsilon)
+    return (bin_weights / total_weight * bin_error).sum()
 
 
 @torch.no_grad()

@@ -162,10 +162,16 @@ def output_report(model, outputs, batch_size, time_steps):
         "saliency": (batch_size, time_steps, model.hierarchy_l5_l6.fine_vertex_count),
         "saliency_l4": (batch_size, time_steps, model.hierarchy_l4_l5.coarse_face_count),
         "uncertainty_l4": (batch_size, time_steps, model.hierarchy_l4_l5.coarse_face_count),
+        "refinement_risk_l4": (
+            batch_size, time_steps, model.hierarchy_l4_l5.coarse_face_count
+        ),
         "budget_l5_pred": (batch_size, time_steps),
         "hard_face_mask_l4": (batch_size, time_steps, model.hierarchy_l4_l5.coarse_face_count),
         "saliency_l5": (batch_size, time_steps, model.hierarchy_l5_l6.coarse_face_count),
         "uncertainty_l5": (batch_size, time_steps, model.hierarchy_l5_l6.coarse_face_count),
+        "refinement_risk_l5": (
+            batch_size, time_steps, model.hierarchy_l5_l6.coarse_face_count
+        ),
         "budget_l6_pred": (batch_size, time_steps),
         "hard_face_mask_l5_effective": (
             batch_size, time_steps, model.hierarchy_l5_l6.coarse_face_count

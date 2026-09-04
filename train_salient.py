@@ -12,14 +12,18 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 from adaptive_objectives import (
+    area_weighted_calibration_error,
     budget_regression_metrics,
     build_error_supervised_budget,
+    build_error_supervised_risk,
 )
 from data.get_saliency_dataloaders import get_dataloaders         
 from network.sphere_model import build_saliency_model
+from network.uahs import classify_budget_head_checkpoint
 from Sphere_SalientScore_torch import *
 from trimesh_utils import *
 EPS = 2.2204e-16
+BUDGET_CONSISTENCY_WEIGHT = 0.1
 BUDGET_LOG_NAMES = (
     "budget_l5_pred",
     "budget_l5_raw_target",
@@ -30,6 +34,20 @@ BUDGET_LOG_NAMES = (
     "budget_l6_alpha_target",
     "budget_l5_selected_area",
     "budget_l6_selected_area",
+    "risk_l5_pred",
+    "risk_l5_target",
+    "risk_l5_brier",
+    "risk_l5_ece",
+    "risk_l5_beta",
+    "risk_l5_temperature",
+    "budget_l5_consistency",
+    "risk_l6_pred",
+    "risk_l6_target",
+    "risk_l6_brier",
+    "risk_l6_ece",
+    "risk_l6_beta",
+    "risk_l6_temperature",
+    "budget_l6_consistency",
     "budget_loss",
 )
 BUDGET_FRAME_KEYS = {
@@ -353,6 +371,28 @@ class Trainer:
             pretrained_dict = pretrained_dict["state_dict"]
         source_parameter_count = len(pretrained_dict)
         source_keys = set(pretrained_dict)
+        has_budget_heads = any(
+            key.startswith("budget_head_") for key in source_keys
+        )
+        layouts = {
+            name: classify_budget_head_checkpoint(source_keys, name)
+            for name in ("budget_head_l4", "budget_head_l5")
+        }
+        if has_budget_heads:
+            invalid = {
+                name: layout for name, layout in layouts.items()
+                if layout not in {"current", "legacy"}
+            }
+            if invalid:
+                raise RuntimeError(
+                    "Incomplete or unknown dynamic-budget checkpoint state: "
+                    f"{invalid}"
+                )
+        migrated_heads = [
+            name for name, layout in layouts.items() if layout == "legacy"
+        ]
+        for name in migrated_heads:
+            getattr(model, name).reset_identity()
         model_dict = model.state_dict()
 
         pretrained_dict = {
@@ -363,19 +403,17 @@ class Trainer:
             f"Loaded {len(pretrained_dict)}/{len(model_dict)} model tensors "
             f"from {source_parameter_count} tensors in {pretrained_path}"
         )
-        if not any(key.startswith("budget_head_") for key in source_keys):
+        if not has_budget_heads:
             print(
-                "Checkpoint predates dynamic budgets; budget heads retain "
-                "their safe 0.25 / 0.125 initialization."
+                "Checkpoint predates dynamic budgets; both risk heads retain "
+                "their configured startup budgets."
             )
-        elif not any(
-                key.startswith("budget_head_l4.face_mlp.")
-                for key in source_keys
-        ):
+        elif migrated_heads:
             print(
-                "Checkpoint uses the former L5 mean/std budget head; its "
-                "weights are ignored and the new DeepSets head retains its "
-                "safe 0.25 initialization."
+                "Checkpoint uses earlier budget heads for "
+                f"{', '.join(migrated_heads)}; their weights are ignored "
+                "and the corresponding Laplace-risk calibration starts "
+                "at beta=0, temperature=1."
             )
 
         model_dict.update(pretrained_dict)
@@ -661,6 +699,20 @@ class Trainer:
             min=self.model.budget_l5_min,
             max=self.model.budget_l5_max,
         )
+        risk_l5_target = build_error_supervised_risk(
+            target_l4,
+            saliency_l4,
+            self.args.budget_error_threshold_l4,
+            self.args.budget_error_temperature_l4,
+        )
+        risk_l5_pred = outputs["refinement_risk_l4"]
+        risk_l6_target = build_error_supervised_risk(
+            target_l5,
+            saliency_l5,
+            self.args.budget_error_threshold_l5,
+            self.args.budget_error_temperature_l5,
+        )
+        risk_l6_pred = outputs["refinement_risk_l5"]
         budget_l6_target = build_error_supervised_budget(
             target_l5,
             saliency_l5,
@@ -677,11 +729,39 @@ class Trainer:
             budget_l6_target
             / selected_area_l5.clamp_min(torch.finfo(budget_l6_target.dtype).eps)
         ).clamp(0, 1)
-        loss_budget_l5 = F.smooth_l1_loss(
+        loss_risk_l5 = self.area_weighted_mean(
+            (risk_l5_pred - risk_l5_target).square(),
+            self.model.hierarchy_l4_l5.coarse_face_areas,
+        )
+        loss_budget_l5_consistency = F.smooth_l1_loss(
             budget_l5_pred, budget_l5_target
         )
-        loss_budget_l6 = F.smooth_l1_loss(
+        loss_budget_l5 = (
+            loss_risk_l5
+            + BUDGET_CONSISTENCY_WEIGHT * loss_budget_l5_consistency
+        )
+        risk_l5_ece = area_weighted_calibration_error(
+            risk_l5_pred,
+            risk_l5_target,
+            self.model.hierarchy_l4_l5.coarse_face_areas,
+        )
+        loss_risk_l6 = self.area_weighted_masked_mean(
+            (risk_l6_pred - risk_l6_target).square(),
+            self.model.hierarchy_l5_l6.coarse_face_areas,
+            outputs["eligible_face_mask_l5"],
+        )
+        loss_budget_l6_consistency = F.smooth_l1_loss(
             budget_l6_alpha_pred, budget_l6_alpha_target
+        )
+        loss_budget_l6 = (
+            loss_risk_l6
+            + BUDGET_CONSISTENCY_WEIGHT * loss_budget_l6_consistency
+        )
+        risk_l6_ece = area_weighted_calibration_error(
+            risk_l6_pred,
+            risk_l6_target,
+            self.model.hierarchy_l5_l6.coarse_face_areas,
+            eligible_mask=outputs["eligible_face_mask_l5"],
         )
         return {
             "loss_saliency_l4": loss_saliency_l4,
@@ -699,6 +779,32 @@ class Trainer:
             "budget_l6_alpha_target": budget_l6_alpha_target.mean(),
             "budget_l5_selected_area": outputs["selected_area_l1"].mean(),
             "budget_l6_selected_area": outputs["selected_area_l2"].mean(),
+            "risk_l5_pred": self.area_weighted_mean(
+                risk_l5_pred, self.model.hierarchy_l4_l5.coarse_face_areas
+            ),
+            "risk_l5_target": self.area_weighted_mean(
+                risk_l5_target, self.model.hierarchy_l4_l5.coarse_face_areas
+            ),
+            "risk_l5_brier": loss_risk_l5,
+            "risk_l5_ece": risk_l5_ece,
+            "risk_l5_beta": self.model.budget_head_l4.beta,
+            "risk_l5_temperature": self.model.budget_head_l4.temperature,
+            "budget_l5_consistency": loss_budget_l5_consistency,
+            "risk_l6_pred": self.area_weighted_masked_mean(
+                risk_l6_pred,
+                self.model.hierarchy_l5_l6.coarse_face_areas,
+                outputs["eligible_face_mask_l5"],
+            ),
+            "risk_l6_target": self.area_weighted_masked_mean(
+                risk_l6_target,
+                self.model.hierarchy_l5_l6.coarse_face_areas,
+                outputs["eligible_face_mask_l5"],
+            ),
+            "risk_l6_brier": loss_risk_l6,
+            "risk_l6_ece": risk_l6_ece,
+            "risk_l6_beta": self.model.budget_head_l5.beta,
+            "risk_l6_temperature": self.model.budget_head_l5.temperature,
+            "budget_l6_consistency": loss_budget_l6_consistency,
             "budget_l5_pred_per_frame": budget_l5_pred,
             "budget_l5_target_per_frame": budget_l5_target,
             "budget_l6_pred_per_frame": budget_l6_pred,
@@ -960,6 +1066,20 @@ class Trainer:
                     "budget_l6_alpha_target",
                     "budget_l5_selected_area",
                     "budget_l6_selected_area",
+                    "risk_l5_pred",
+                    "risk_l5_target",
+                    "risk_l5_brier",
+                    "risk_l5_ece",
+                    "risk_l5_beta",
+                    "risk_l5_temperature",
+                    "budget_l5_consistency",
+                    "risk_l6_pred",
+                    "risk_l6_target",
+                    "risk_l6_brier",
+                    "risk_l6_ece",
+                    "risk_l6_beta",
+                    "risk_l6_temperature",
+                    "budget_l6_consistency",
             ):
                 outputs[name] = auxiliary_losses[name].detach()
             for prediction_key, target_key in BUDGET_FRAME_KEYS.values():
