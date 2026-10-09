@@ -9,7 +9,12 @@ from .DataLoader360Video import AVSSaliencyDataset, SaliencyDataset
 
 
 def resolve_dataset_split(dataset_name, dataset_split):
-    """Return the split supported by the selected dataset."""
+    """Return the split supported by the selected dataset.
+
+    AVS-ODV provides splits 1--3, whereas list-based video datasets provide fewer splits.
+    Keep ``--dataset_split 3`` usable for shared command lines by falling back to
+    the default split 1 for list-based datasets.
+    """
     if dataset_name == "VR-EyeTracking" and dataset_split != 1:
         raise ValueError("VR-EyeTracking provides only dataset_split=1")
     if dataset_name in {"SVGC_AVA", "Sports-360"} and dataset_split == 3:
@@ -48,7 +53,7 @@ def _video_ids(dataset_root_dir, data_type):
 
 
 def _split_video_ids(dataset_root_dir, data_type, dataset_split, dataset_name):
-    """Read the dataset's explicit video-level train/test split."""
+    """读取 train_list_N.txt / test_list_N.txt，返回视频 ID 列表。"""
     split_file = (
         f"{data_type}_list.txt" if dataset_name == "VR-EyeTracking"
         else f"{data_type}_list_{dataset_split}.txt"

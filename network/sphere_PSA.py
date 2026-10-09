@@ -536,8 +536,7 @@ class SparseSphereSelfAttention(nn.Module):
 
     Keys and values are gathered from the exact fixed neighborhood used by
     :class:`SphereSelfAttention`. No dense high-resolution attention output is
-    formed before selection. ``selected_query_features`` may optionally override
-    only the selected Q features without densely updating neighborhood K/V.
+    formed before selection.
     """
 
     LOGIT_SCALE_PRE_REL_BIAS: bool = True
@@ -614,13 +613,7 @@ class SparseSphereSelfAttention(nn.Module):
         )
         return bias.squeeze(0).permute(1, 0, 2)
 
-    def forward(
-            self,
-            x: Tensor,
-            selected_queries: Tensor,
-            pos=None,
-            selected_query_features: Optional[Tensor] = None,
-    ):
+    def forward(self, x: Tensor, selected_queries: Tensor, pos=None):
         if x.ndim != 3 or selected_queries.shape != x.shape[:2]:
             raise ValueError("Expected x [N,V,C] and selected_queries [N,V]")
         selected_queries = selected_queries.bool()
@@ -635,16 +628,7 @@ class SparseSphereSelfAttention(nn.Module):
         vertex_indices = query_pairs[:, 1]
         neighbor_indices = self.rel_pos_bias.idx[0, 0, :, :, 0][vertex_indices]
         neighbor_mask = self.rel_pos_bias.idx_mask[0, 0][vertex_indices]
-        if selected_query_features is None:
-            query_features = x[batch_indices, vertex_indices]
-        else:
-            expected_shape = (query_count, self.d_model)
-            if selected_query_features.shape != expected_shape:
-                raise ValueError(
-                    "selected_query_features must have shape "
-                    f"{expected_shape}, got {tuple(selected_query_features.shape)}"
-                )
-            query_features = selected_query_features
+        query_features = x[batch_indices, vertex_indices]
         neighbor_features = x[batch_indices.unsqueeze(1), neighbor_indices]
 
         query = self.q_proj(query_features).reshape(
@@ -707,7 +691,7 @@ class SparseSphereSelfAttention(nn.Module):
 
 
 class SparseLocalRefinementBlock(nn.Module):
-    """Selected-query spatial attention and FFN at a fine level."""
+    """Selected-query spatial attention and FFN for a fine sphere level."""
 
     def __init__(
             self, *,
@@ -772,21 +756,15 @@ class SparseLocalRefinementBlock(nn.Module):
         )
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
-    def forward(
-            self,
-            dense_features: Tensor,
-            selected_queries: Tensor,
-    ):
+    def forward(self, dense_features: Tensor, selected_queries: Tensor):
         normalized = self.norm1(dense_features)
         pos = self.abs_pos_enc(normalized) if self.abs_pos_enc is not None else None
-        spatial_delta, query_pairs = self.attention(
-            normalized,
-            selected_queries,
-            pos,
+        attention, query_pairs = self.attention(
+            normalized, selected_queries, pos
         )
         if query_pairs.shape[0] == 0:
-            return spatial_delta, query_pairs
+            return attention, query_pairs
         selected = dense_features[query_pairs[:, 0], query_pairs[:, 1]]
-        selected = selected + self.drop_path(spatial_delta)
+        selected = selected + self.drop_path(attention)
         selected = selected + self.drop_path(self.mlp(self.norm2(selected)))
         return selected, query_pairs

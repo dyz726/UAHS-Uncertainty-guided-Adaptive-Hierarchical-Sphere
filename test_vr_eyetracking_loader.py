@@ -197,7 +197,7 @@ class VREyeTrackingLoaderTest(unittest.TestCase):
         )
         self.assertEqual(
             cv2.imread(str(video_dir / "0036.png"), cv2.IMREAD_GRAYSCALE).shape,
-            (32, 64),
+            (128, 256),
         )
         with mock.patch.dict("sys.modules", {"hdf5storage": None}):
             runner.save_mat_results()
@@ -206,6 +206,49 @@ class VREyeTrackingLoaderTest(unittest.TestCase):
             contents["frame_indices"].reshape(-1).tolist(),
             list(range(12, 24)) + [36],
         )
+
+
+    def test_trainer_test_excludes_padding_and_weights_real_frames(self):
+        from train_salient import Trainer
+
+        trainer = Trainer.__new__(Trainer)
+        trainer.args = SimpleNamespace(dataset_name="VR-EyeTracking")
+        trainer.device = torch.device("cpu")
+        trainer.writer = None
+        trainer.model = torch.nn.Identity()
+        trainer.loader_val = [{
+            "normalized_sphere_rgb": torch.zeros(2, 12, 42),
+            "normalized_sphere_sal": torch.zeros(2, 12, 42),
+            "normalized_sphere_fix": torch.zeros(2, 12, 42),
+            "valid_length": torch.tensor([12, 1]),
+        }]
+        lengths = []
+
+        def metrics(pred, sal, fix, device):
+            lengths.append(pred.shape[1])
+            self.assertEqual(pred.shape, sal.shape)
+            self.assertEqual(pred.shape, fix.shape)
+            value = 2.0 if pred.shape[1] == 12 else 4.0
+            return {key: torch.tensor(value) for key in ("AUC", "NSS", "CC", "SIM", "KL")}
+
+        with mock.patch("train_salient.batch_compute_metrics", side_effect=metrics):
+            results = trainer.test()
+        self.assertEqual(lengths, [12, 1])
+        for value in results.values():
+            self.assertAlmostEqual(value, 28.0 / 13)
+
+    def test_standalone_erp_evaluation_uses_valid_clip_coverage(self):
+        from evaluation import main
+
+        with mock.patch("evaluation.evaluate_saliency_maps_in_folder") as evaluate:
+            main([
+                "--dataset_name", "VR-EyeTracking",
+                "--dataset_root_dir", str(self.root),
+                "--saliency_folder", str(self.root / "predictions"),
+                "--seq_length", "12",
+            ])
+        expected = evaluate.call_args.kwargs["expected_frames"]
+        self.assertEqual([int(frame[1]) for frame in expected], list(range(12, 24)) + [36])
 
 
 if __name__ == "__main__":

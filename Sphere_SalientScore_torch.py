@@ -133,5 +133,5 @@ def batch_compute_metrics(pred_sal, gt_sal, gt_fix,device):
                 metrics[k].append(v)
 
 
-    return {k: torch.mean(torch.stack(v)) if v else pred_sal.new_tensor(0.0)
+    return {k: torch.mean(torch.stack(v)) if v else torch.tensor(0.0)
             for k, v in metrics.items()}

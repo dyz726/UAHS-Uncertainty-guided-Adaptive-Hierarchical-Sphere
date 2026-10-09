@@ -8,18 +8,70 @@ import wandb
 import numpy as np
 import cv2
 import torch
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
+from adaptive_objectives import (
+    area_weighted_calibration_error,
+    budget_regression_metrics,
+    build_error_supervised_budget,
+    build_error_supervised_risk,
+)
 from data.get_saliency_dataloaders import get_dataloaders         
 from network.sphere_model import build_saliency_model
 from Sphere_SalientScore_torch import *
 from trimesh_utils import *
 EPS = 2.2204e-16
+BUDGET_CONSISTENCY_WEIGHT = 0.1
+BUDGET_LOG_NAMES = (
+    "budget_l5_pred",
+    "budget_l5_raw_target",
+    "budget_l5_target",
+    "budget_l6_pred",
+    "budget_l6_target",
+    "budget_l6_alpha_pred",
+    "budget_l6_alpha_target",
+    "budget_l5_selected_area",
+    "budget_l6_selected_area",
+    "risk_l5_pred",
+    "risk_l5_target",
+    "risk_l5_brier",
+    "risk_l5_ece",
+    "risk_l5_beta",
+    "risk_l5_temperature",
+    "budget_l5_consistency",
+    "risk_l6_pred",
+    "risk_l6_target",
+    "risk_l6_brier",
+    "risk_l6_ece",
+    "risk_l6_beta",
+    "risk_l6_temperature",
+    "budget_l6_consistency",
+    "budget_loss",
+)
+BUDGET_FRAME_KEYS = {
+    "l5": ("budget_l5_pred_per_frame", "budget_l5_target_per_frame"),
+    "l6": ("budget_l6_pred_per_frame", "budget_l6_target_per_frame"),
+}
 
 
 class Trainer:
     def __init__(self, args):
         self.args = args
+        # Preserve programmatic callers that construct an older argument
+        # namespace instead of using the current train.py parser.
+        for name, default in {
+                "budget_l5_min": 0.05,
+                "budget_l5_max": 0.50,
+                "budget_error_threshold_l4": 0.05,
+                "budget_error_threshold_l5": 0.05,
+                "budget_error_temperature_l4": 0.02,
+                "budget_error_temperature_l5": 0.02,
+                "lambda_budget_l5": 1.0,
+                "lambda_budget_l6": 1.0,
+        }.items():
+            if not hasattr(args, name):
+                setattr(args, name, default)
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() and args.use_gpu else "cpu"
         )
@@ -36,15 +88,22 @@ class Trainer:
             scale_depth=args.scale_depth,
             model_type=args.model_type,
             coarse_pool_type=getattr(args, "coarse_pool_type", "mean_max"),
-            temporal_window_radius=args.temporal_window_radius,
             target_refine_ratio_l1=args.target_refine_ratio_l1,
             target_refine_ratio_l2=args.target_refine_ratio_l2,
+            budget_l5_min=args.budget_l5_min,
+            budget_l5_max=args.budget_l5_max,
+            budget_error_threshold_l4=args.budget_error_threshold_l4,
+            budget_error_threshold_l5=args.budget_error_threshold_l5,
+            budget_error_temperature_l4=args.budget_error_temperature_l4,
+            budget_error_temperature_l5=args.budget_error_temperature_l5,
             global_query_chunk_size=args.global_query_chunk_size,
             hard_selection_warmup_epochs=args.hard_selection_warmup_epochs,
             lambda_saliency_l4=args.lambda_saliency_l4,
             lambda_saliency_l5=args.lambda_saliency_l5,
             lambda_uncertainty_l4=args.lambda_uncertainty_l4,
             lambda_uncertainty_l5=args.lambda_uncertainty_l5,
+            lambda_budget_l5=args.lambda_budget_l5,
+            lambda_budget_l6=args.lambda_budget_l6,
         )
 
                     
@@ -127,11 +186,22 @@ class Trainer:
                 "Expected 0 <= target_refine_ratio_l2 <= "
                 "target_refine_ratio_l1 <= 1"
             )
+        if not 0 <= args.budget_l5_min < args.budget_l5_max <= 1:
+            raise ValueError("Expected 0 <= budget_l5_min < budget_l5_max <= 1")
+        if not args.budget_l5_min <= target_ratio_l1 <= args.budget_l5_max:
+            raise ValueError("Initial L5 budget must be inside its output range")
+        if min(
+                args.budget_error_temperature_l4,
+                args.budget_error_temperature_l5,
+        ) <= 0:
+            raise ValueError("Budget error temperatures must be positive")
         loss_weights = (
             args.lambda_saliency_l4,
             args.lambda_saliency_l5,
             args.lambda_uncertainty_l4,
             args.lambda_uncertainty_l5,
+            args.lambda_budget_l5,
+            args.lambda_budget_l6,
         )
         if min(loss_weights) < 0:
             raise ValueError("UAHS loss weights must be non-negative")
@@ -237,6 +307,41 @@ class Trainer:
             {"params": no_decay_params, "weight_decay": 0.0},
         ]
 
+    @staticmethod
+    def new_budget_diagnostic_buffer():
+        return {
+            level: {"prediction": [], "target": []}
+            for level in BUDGET_FRAME_KEYS
+        }
+
+    @staticmethod
+    def update_budget_diagnostic_buffer(buffer, outputs):
+        for level, (prediction_key, target_key) in BUDGET_FRAME_KEYS.items():
+            if prediction_key not in outputs or target_key not in outputs:
+                continue
+            buffer[level]["prediction"].append(
+                outputs[prediction_key].detach().reshape(-1).cpu()
+            )
+            buffer[level]["target"].append(
+                outputs[target_key].detach().reshape(-1).cpu()
+            )
+
+    @staticmethod
+    def summarize_budget_diagnostic_buffer(buffer):
+        summary = {}
+        for level, values in buffer.items():
+            if not values["prediction"]:
+                continue
+            metrics = budget_regression_metrics(
+                torch.cat(values["prediction"]),
+                torch.cat(values["target"]),
+            )
+            summary.update({
+                f"budget_{level}_{name}": value
+                for name, value in metrics.items()
+            })
+        return summary
+
     def get_learning_rate(self, optimizer_step: int) -> float:
         if self.args.lr_scheduler != "warmup_cosine":
             return self.optimizer.param_groups[0]["lr"]
@@ -263,25 +368,23 @@ class Trainer:
         pretrained_dict = torch.load(pretrained_path, map_location="cpu")
         if "state_dict" in pretrained_dict:
             pretrained_dict = pretrained_dict["state_dict"]
+        pretrained_dict = {
+            (key[7:] if key.startswith("module.") else key): value
+            for key, value in pretrained_dict.items()
+        }
         source_parameter_count = len(pretrained_dict)
         model_dict = model.state_dict()
-        compatible_dict = {
+
+        pretrained_dict = {
             key: value for key, value in pretrained_dict.items()
             if key in model_dict and value.shape == model_dict[key].shape
         }
-        skipped_keys = sorted(set(pretrained_dict) - set(compatible_dict))
-        initialized_keys = sorted(set(model_dict) - set(compatible_dict))
         print(
-            f"Loaded {len(compatible_dict)}/{len(model_dict)} model tensors "
+            f"Loaded {len(pretrained_dict)}/{len(model_dict)} model tensors "
             f"from {source_parameter_count} tensors in {pretrained_path}"
         )
-        if skipped_keys:
-            print(f"Ignored {len(skipped_keys)} incompatible checkpoint tensors")
-        if initialized_keys:
-            print(f"Initialized {len(initialized_keys)} new model tensors")
-
-        model_dict.update(compatible_dict)
-        model.load_state_dict(model_dict, strict=True)
+        model_dict.update(pretrained_dict)
+        model.load_state_dict(model_dict)
 
         return model
 
@@ -434,10 +537,46 @@ class Trainer:
         self.step = 0
         self.start_time = time.time()
         try:
+            if self.args.dataset_name == "VR-EyeTracking":
+                return self._test_vr_eyetracking()
             self.validate()
         finally:
             if self.writer:
                 self.writer.close()
+
+    @torch.no_grad()
+    def _test_vr_eyetracking(self):
+        """Evaluate only real frames; exclude tail padding from all metrics."""
+        self.model.eval()
+        if hasattr(self.model, "set_epoch"):
+            self.model.set_epoch(self.epoch)
+        totals = {name: 0.0 for name in ("AUC", "NSS", "CC", "SIM", "KL")}
+        frame_count = 0
+        for batch in tqdm.tqdm(self.loader_val, desc="VR-EyeTracking test"):
+            rgb = batch["normalized_sphere_rgb"].to(self.device)
+            predictions = self.model(rgb)
+            if isinstance(predictions, dict):
+                predictions = predictions["saliency"]
+            for sample_idx, valid_length in enumerate(batch["valid_length"].tolist()):
+                metrics = batch_compute_metrics(
+                    predictions[sample_idx:sample_idx + 1, :valid_length],
+                    batch["normalized_sphere_sal"][
+                        sample_idx:sample_idx + 1, :valid_length
+                    ].to(self.device),
+                    batch["normalized_sphere_fix"][
+                        sample_idx:sample_idx + 1, :valid_length
+                    ].to(self.device),
+                    self.device,
+                )
+                for name, value in metrics.items():
+                    totals[name] += value.item() * valid_length
+                frame_count += valid_length
+        if not frame_count:
+            raise RuntimeError("No valid VR-EyeTracking test frames")
+        results = {name: total / frame_count for name, total in totals.items()}
+        print(f"Test real frames: {frame_count}")
+        print("Test Sphere Metrics:", results)
+        return results
 
     def train(self):
         """主训练循环"""
@@ -497,8 +636,27 @@ class Trainer:
         weights = weights / weights.sum()
         return (values * weights.reshape(1, 1, -1)).sum(dim=-1).mean()
 
+    @staticmethod
+    def area_weighted_masked_mean(values, face_areas, mask):
+        """Average each non-empty frame over only its eligible spherical area."""
+        if mask.shape != values.shape:
+            raise ValueError("mask and values must have identical shapes")
+        areas = face_areas.to(device=values.device, dtype=values.dtype)
+        weights = (
+            areas.reshape(1, 1, -1)
+            * mask.detach().to(device=values.device, dtype=values.dtype)
+        )
+        numerator = (values * weights).sum(dim=-1)
+        denominator = weights.sum(dim=-1)
+        valid = denominator > 0
+        per_frame = numerator / denominator.clamp_min(
+            torch.finfo(values.dtype).eps
+        )
+        per_frame = torch.where(valid, per_frame, torch.zeros_like(per_frame))
+        return per_frame.sum() / valid.to(values.dtype).sum().clamp_min(1)
+
     def compute_uahs_losses(self, ground_truth, outputs):
-        """Supervise saliency and uncertainty under fixed refinement budgets."""
+        """Supervise saliency, uncertainty, and detached-U dynamic budgets."""
         B, T = ground_truth.shape[:2]
         target_l4 = self.model.aggregate_img_values_to_l4_faces(ground_truth)
         target_l5 = self.model.aggregate_img_values_to_l5_faces(ground_truth)
@@ -528,14 +686,132 @@ class Trainer:
         loss_uncertainty_l4 = self.area_weighted_mean(
             laplace_l4, self.model.hierarchy_l4_l5.coarse_face_areas
         )
-        loss_uncertainty_l5 = self.area_weighted_mean(
-            laplace_l5, self.model.hierarchy_l5_l6.coarse_face_areas
+        loss_uncertainty_l5 = self.area_weighted_masked_mean(
+            laplace_l5,
+            self.model.hierarchy_l5_l6.coarse_face_areas,
+            outputs["eligible_face_mask_l5"],
+        )
+        budget_l5_raw_target = build_error_supervised_budget(
+            target_l4,
+            saliency_l4,
+            self.model.hierarchy_l4_l5.coarse_face_areas,
+            self.args.budget_error_threshold_l4,
+            self.args.budget_error_temperature_l4,
+        )
+        budget_l5_target = budget_l5_raw_target.clamp(
+            min=self.model.budget_l5_min,
+            max=self.model.budget_l5_max,
+        )
+        risk_l5_target = build_error_supervised_risk(
+            target_l4,
+            saliency_l4,
+            self.args.budget_error_threshold_l4,
+            self.args.budget_error_temperature_l4,
+        )
+        risk_l5_pred = outputs["refinement_risk_l4"]
+        risk_l6_target = build_error_supervised_risk(
+            target_l5,
+            saliency_l5,
+            self.args.budget_error_threshold_l5,
+            self.args.budget_error_temperature_l5,
+        )
+        risk_l6_pred = outputs["refinement_risk_l5"]
+        budget_l6_target = build_error_supervised_budget(
+            target_l5,
+            saliency_l5,
+            self.model.hierarchy_l5_l6.coarse_face_areas,
+            self.args.budget_error_threshold_l5,
+            self.args.budget_error_temperature_l5,
+            eligible_mask=outputs["eligible_face_mask_l5"],
+        )
+        budget_l5_pred = outputs["budget_l5_pred"]
+        budget_l6_pred = outputs["budget_l6_pred"]
+        budget_l6_alpha_pred = outputs["budget_l6_alpha"]
+        selected_area_l5 = outputs["selected_area_l1"].detach()
+        budget_l6_alpha_target = (
+            budget_l6_target
+            / selected_area_l5.clamp_min(torch.finfo(budget_l6_target.dtype).eps)
+        ).clamp(0, 1)
+        loss_risk_l5 = self.area_weighted_mean(
+            (risk_l5_pred - risk_l5_target).square(),
+            self.model.hierarchy_l4_l5.coarse_face_areas,
+        )
+        loss_budget_l5_consistency = F.smooth_l1_loss(
+            budget_l5_pred, budget_l5_target
+        )
+        loss_budget_l5 = (
+            loss_risk_l5
+            + BUDGET_CONSISTENCY_WEIGHT * loss_budget_l5_consistency
+        )
+        risk_l5_ece = area_weighted_calibration_error(
+            risk_l5_pred,
+            risk_l5_target,
+            self.model.hierarchy_l4_l5.coarse_face_areas,
+        )
+        loss_risk_l6 = self.area_weighted_masked_mean(
+            (risk_l6_pred - risk_l6_target).square(),
+            self.model.hierarchy_l5_l6.coarse_face_areas,
+            outputs["eligible_face_mask_l5"],
+        )
+        loss_budget_l6_consistency = F.smooth_l1_loss(
+            budget_l6_alpha_pred, budget_l6_alpha_target
+        )
+        loss_budget_l6 = (
+            loss_risk_l6
+            + BUDGET_CONSISTENCY_WEIGHT * loss_budget_l6_consistency
+        )
+        risk_l6_ece = area_weighted_calibration_error(
+            risk_l6_pred,
+            risk_l6_target,
+            self.model.hierarchy_l5_l6.coarse_face_areas,
+            eligible_mask=outputs["eligible_face_mask_l5"],
         )
         return {
             "loss_saliency_l4": loss_saliency_l4,
             "loss_saliency_l5": loss_saliency_l5,
             "loss_uncertainty_l4": loss_uncertainty_l4,
             "loss_uncertainty_l5": loss_uncertainty_l5,
+            "loss_budget_l5": loss_budget_l5,
+            "loss_budget_l6": loss_budget_l6,
+            "budget_l5_pred": budget_l5_pred.mean(),
+            "budget_l5_raw_target": budget_l5_raw_target.mean(),
+            "budget_l5_target": budget_l5_target.mean(),
+            "budget_l6_pred": budget_l6_pred.mean(),
+            "budget_l6_target": budget_l6_target.mean(),
+            "budget_l6_alpha_pred": budget_l6_alpha_pred.mean(),
+            "budget_l6_alpha_target": budget_l6_alpha_target.mean(),
+            "budget_l5_selected_area": outputs["selected_area_l1"].mean(),
+            "budget_l6_selected_area": outputs["selected_area_l2"].mean(),
+            "risk_l5_pred": self.area_weighted_mean(
+                risk_l5_pred, self.model.hierarchy_l4_l5.coarse_face_areas
+            ),
+            "risk_l5_target": self.area_weighted_mean(
+                risk_l5_target, self.model.hierarchy_l4_l5.coarse_face_areas
+            ),
+            "risk_l5_brier": loss_risk_l5,
+            "risk_l5_ece": risk_l5_ece,
+            "risk_l5_beta": self.model.budget_head_l4.beta,
+            "risk_l5_temperature": self.model.budget_head_l4.temperature,
+            "budget_l5_consistency": loss_budget_l5_consistency,
+            "risk_l6_pred": self.area_weighted_masked_mean(
+                risk_l6_pred,
+                self.model.hierarchy_l5_l6.coarse_face_areas,
+                outputs["eligible_face_mask_l5"],
+            ),
+            "risk_l6_target": self.area_weighted_masked_mean(
+                risk_l6_target,
+                self.model.hierarchy_l5_l6.coarse_face_areas,
+                outputs["eligible_face_mask_l5"],
+            ),
+            "risk_l6_brier": loss_risk_l6,
+            "risk_l6_ece": risk_l6_ece,
+            "risk_l6_beta": self.model.budget_head_l5.beta,
+            "risk_l6_temperature": self.model.budget_head_l5.temperature,
+            "budget_l6_consistency": loss_budget_l6_consistency,
+            "budget_l5_pred_per_frame": budget_l5_pred,
+            "budget_l5_target_per_frame": budget_l5_target,
+            "budget_l6_pred_per_frame": budget_l6_pred,
+            "budget_l6_target_per_frame": budget_l6_target,
         }
 
     def train_one_epoch(self):
@@ -548,11 +824,19 @@ class Trainer:
         pbar.set_description(f"## {self.args.exp_name} ## Training Epoch_{self.epoch}")
         loss_sum = []
         sal_metrics = {'AUC': [], 'NSS': [], 'CC': [], 'SIM': [], 'KL': []}
+        budget_metrics = {name: [] for name in BUDGET_LOG_NAMES}
+        budget_diagnostic_buffer = self.new_budget_diagnostic_buffer()
         for batch_idx, inputs in enumerate(pbar, start=1):
             self.mini_step += 1
             inputs_ = self.inputs_to_device(inputs)
             outputs, losses = self.process_batch(inputs_,inputs["videoID"])
             loss_sum.append(losses["loss"].item())
+            for name in BUDGET_LOG_NAMES:
+                if name in outputs:
+                    budget_metrics[name].append(float(outputs[name].item()))
+            self.update_budget_diagnostic_buffer(
+                budget_diagnostic_buffer, outputs
+            )
 
             group_start = ((batch_idx - 1) // self.args.accum_grads) * self.args.accum_grads
             group_size = min(
@@ -594,8 +878,20 @@ class Trainer:
             for name, values in sal_metrics.items()
             if values
         }
+        train_budget_metrics = {
+            name: sum(values) / len(values)
+            for name, values in budget_metrics.items()
+            if values
+        }
+        train_budget_diagnostics = self.summarize_budget_diagnostic_buffer(
+            budget_diagnostic_buffer
+        )
         print("Train Mean Loss:", train_loss)
         print("Train Metrics:", train_metrics)
+        if train_budget_metrics:
+            print("Train Dynamic Budgets:", train_budget_metrics)
+        if train_budget_diagnostics:
+            print("Train Per-frame Budget Diagnostics:", train_budget_diagnostics)
 
         if self.writer:
             self.writer.add_scalar("train/loss", train_loss, self.epoch)
@@ -603,6 +899,10 @@ class Trainer:
                 "train/learning_rate", self.optimizer.param_groups[0]["lr"], self.epoch
             )
             for name, value in train_metrics.items():
+                self.writer.add_scalar(f"train/{name}", value, self.epoch)
+            for name, value in train_budget_metrics.items():
+                self.writer.add_scalar(f"train/{name}", value, self.epoch)
+            for name, value in train_budget_diagnostics.items():
                 self.writer.add_scalar(f"train/{name}", value, self.epoch)
             self.writer.flush()
 
@@ -612,6 +912,14 @@ class Trainer:
                     "train/loss": train_loss,
                     "train/learning_rate": self.optimizer.param_groups[0]["lr"],
                     **{f"train/{name}": value for name, value in train_metrics.items()},
+                    **{
+                        f"train/{name}": value
+                        for name, value in train_budget_metrics.items()
+                    },
+                    **{
+                        f"train/{name}": value
+                        for name, value in train_budget_diagnostics.items()
+                    },
                 },
                 step=self.epoch,
                 commit=False,
@@ -626,12 +934,20 @@ class Trainer:
         pbar.set_description(f"Validating Epoch_{self.epoch}")
         loss_sum = []
         sal_metrics = {'AUC': [], 'NSS': [], 'CC': [], 'SIM': [], 'KL': []}
+        budget_metrics = {name: [] for name in BUDGET_LOG_NAMES}
+        budget_diagnostic_buffer = self.new_budget_diagnostic_buffer()
         with torch.no_grad():
             for batch_idx, inputs in enumerate(pbar):
                 inputs_ = self.inputs_to_device(inputs)
                 outputs, losses = self.process_batch(inputs_,inputs["videoID"])
 
                 loss_sum.append(losses["loss"].item())
+                for name in BUDGET_LOG_NAMES:
+                    if name in outputs:
+                        budget_metrics[name].append(float(outputs[name].item()))
+                self.update_budget_diagnostic_buffer(
+                    budget_diagnostic_buffer, outputs
+                )
                                
                 pred_sal = outputs["pred_sal"]                      
                 gt_sal = inputs_["normalized_sphere_sal"]                      
@@ -649,12 +965,28 @@ class Trainer:
             for name, values in sal_metrics.items()
             if values
         }
+        val_budget_metrics = {
+            name: sum(values) / len(values)
+            for name, values in budget_metrics.items()
+            if values
+        }
+        val_budget_diagnostics = self.summarize_budget_diagnostic_buffer(
+            budget_diagnostic_buffer
+        )
         print("Val Mean Loss:", current_val_loss)
         print("Val Metrics:", val_metrics)
+        if val_budget_metrics:
+            print("Val Dynamic Budgets:", val_budget_metrics)
+        if val_budget_diagnostics:
+            print("Val Per-frame Budget Diagnostics:", val_budget_diagnostics)
 
         if self.writer:
             self.writer.add_scalar("val/loss", current_val_loss, self.epoch)
             for name, value in val_metrics.items():
+                self.writer.add_scalar(f"val/{name}", value, self.epoch)
+            for name, value in val_budget_metrics.items():
+                self.writer.add_scalar(f"val/{name}", value, self.epoch)
+            for name, value in val_budget_diagnostics.items():
                 self.writer.add_scalar(f"val/{name}", value, self.epoch)
             self.writer.flush()
 
@@ -663,6 +995,14 @@ class Trainer:
                 {
                     "val/loss": current_val_loss,
                     **{f"val/{name}": value for name, value in val_metrics.items()},
+                    **{
+                        f"val/{name}": value
+                        for name, value in val_budget_metrics.items()
+                    },
+                    **{
+                        f"val/{name}": value
+                        for name, value in val_budget_diagnostics.items()
+                    },
                 },
                 step=self.epoch,
                 commit=True,
@@ -676,13 +1016,9 @@ class Trainer:
         gt_sal = inputs["normalized_sphere_sal"]
         gt_fix = inputs["normalized_sphere_fix"]
 
-        is_uahs = self.args.model_type == "uahs"
-        if is_uahs:
-            uahs_outputs = self.model(x, return_aux=True)
-            pred_sal = uahs_outputs["saliency"]
-        else:
-            uahs_outputs = None
-            pred_sal = self.model(x)
+        pred_sal = self.model(x)
+        if isinstance(pred_sal, dict):
+            pred_sal = pred_sal["saliency"]
 
               
         B, T, L = gt_sal.shape
@@ -693,32 +1029,13 @@ class Trainer:
                   
         loss_rec = self.loss_kl(pre_probs, gt_probs,gt_fix)/(B*T)
 
-        auxiliary_losses = {}
         total_loss = loss_rec
-        if uahs_outputs is not None:
-            auxiliary_losses = self.compute_uahs_losses(gt_sal, uahs_outputs)
-            total_loss = (
-                loss_rec
-                + self.args.lambda_saliency_l4
-                * auxiliary_losses["loss_saliency_l4"]
-                + self.args.lambda_saliency_l5
-                * auxiliary_losses["loss_saliency_l5"]
-                + self.args.lambda_uncertainty_l4
-                * auxiliary_losses["loss_uncertainty_l4"]
-                + self.args.lambda_uncertainty_l5
-                * auxiliary_losses["loss_uncertainty_l5"]
-            )
 
         outputs = {"pred_sal": pred_sal.detach()}
         losses = {
             "loss": total_loss,
             "loss_saliency": loss_rec,
         }
-        losses.update({
-            name: value
-            for name, value in auxiliary_losses.items()
-            if name.startswith("loss_")
-        })
         return outputs, losses
 
     def save_model(self):

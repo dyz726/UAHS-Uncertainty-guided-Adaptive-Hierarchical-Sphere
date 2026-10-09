@@ -104,8 +104,7 @@ class SaliencyDataset(Dataset):
         self.norm_std = torch.tensor([0.229, 0.224, 0.225])
 
         if self.dataname in {"SVGC_AVA", "Sports-360", "VR-EyeTracking"}:
-            # These datasets keep all videos and annotations in shared directories;
-            # train/test lists determine the logical split.
+            # These datasets use split lists instead of physical train/test folders.
             self.video_base_dir = self.root_dir / "videos"
             self.annotation_base_dir = self.root_dir
         else:

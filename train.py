@@ -44,9 +44,9 @@ parser.add_argument(
     type=int,
     default=1,
     choices=[1, 2, 3],
-    help="数据集划分方式编号；VR-EyeTracking 使用 train_list.txt / "
-         "test_list.txt 且只提供划分 1；编号 3 仅对 AVS-ODV 生效，"
-         "SVGC_AVA/Sports-360 选择 3 时使用默认划分 1",
+    help="VR-EyeTracking 使用 train_list.txt / test_list.txt 且仅支持划分 1；"
+         "其他数据集使用 train_list_N.txt / test_list_N.txt；"
+         "编号 3 仅对 AVS-ODV 生效，SVGC_AVA/Sports-360 选择 3 时使用默认划分 1",
 )
 parser.add_argument("--seq_length", type=int, default=12)
 
@@ -78,7 +78,7 @@ parser.add_argument(
     help="temporal half-window radius; use 'none' for full temporal attention",
 )
 
-# Final UAHS and the published SphereUFormer baseline.
+# L4-only attention ablation and the published SphereUFormer baseline.
 parser.add_argument(
     "--model_type",
     type=str,
@@ -93,10 +93,18 @@ parser.add_argument(
 )
 parser.add_argument("--target_refine_ratio_l1", type=float, default=0.25)
 parser.add_argument("--target_refine_ratio_l2", type=float, default=0.125)
+parser.add_argument("--budget_l5_min", type=float, default=0.05)
+parser.add_argument("--budget_l5_max", type=float, default=0.50)
+parser.add_argument("--budget_error_threshold_l4", type=float, default=0.05)
+parser.add_argument("--budget_error_threshold_l5", type=float, default=0.05)
+parser.add_argument("--budget_error_temperature_l4", type=float, default=0.02)
+parser.add_argument("--budget_error_temperature_l5", type=float, default=0.02)
 parser.add_argument("--lambda_saliency_l4", type=float, default=0.15)
 parser.add_argument("--lambda_saliency_l5", type=float, default=0.15)
 parser.add_argument("--lambda_uncertainty_l4", type=float, default=0.05)
 parser.add_argument("--lambda_uncertainty_l5", type=float, default=0.05)
+parser.add_argument("--lambda_budget_l5", type=float, default=1.0)
+parser.add_argument("--lambda_budget_l6", type=float, default=1.0)
 parser.add_argument("--global_query_chunk_size", type=int, default=128)
 parser.add_argument("--hard_selection_warmup_epochs", type=int, default=0)
 parser.add_argument("--return_aux", action="store_true")
@@ -198,20 +206,21 @@ if __name__ == "__main__":
     main()
 
 """
+Sports-360、AVS-ODV 或 SVGC_AVA
  CUDA_VISIBLE_DEVICES=0 \
-  python /home/dyz/PythonProject/Test_Codes/Sampling_test/train.py \
+  python /home/dyz/PythonProject/Test_Codes/sports_test/train.py \
     --model_type uahs \
     --dataset_name Sports-360 \
+    --dataset_split 1 \
     --dataset_root_dir /home/dyz/PythonProject/Dataset/Sports-360 \
     --mode vertex \
     --img_rank 6 \
     --seq_length 12 \
     --temporal_window_radius none \
     --rel_pos_init_variance 0 \
-    --coarse_pool_type mean_max \
+    --coarse_pool_type center \
+    --hard_selection_warmup_epochs 0 \
     --global_query_chunk_size 128 \
-    --target_refine_ratio_l1 0.25 \
-    --target_refine_ratio_l2 0.125 \
     --train_batch_size 1 \
     --val_batch_size 1 \
     --num_workers 8 \
@@ -224,13 +233,8 @@ if __name__ == "__main__":
     --weight_decay 1e-4 \
     --use_checkpoint 1 \
     --accum_grads 1 \
-    --exp_name uahs \
-    --log_dir /home/dyz/PythonProject/Test_Codes/Sampling_test/log/uahs-V2 \
-    --tensorboard_log_dir /home/dyz/PythonProject/log/tensorboard/uahs-V2
+    --exp_name l4-attention-ablation-center \
+    --log_dir /home/dyz/PythonProject/Test_Codes/sports_test/log/l4-attention-ablation-center \
+    --tensorboard_log_dir /home/dyz/PythonProject/log/tensorboard/l4-attention-ablation-center
 
-
-conda run -n sphereformer tensorboard \
-      --logdir=/home/dyz/PythonProject/log/tensorboard \
-      --host 0.0.0.0 \
-      --port 6006
 """

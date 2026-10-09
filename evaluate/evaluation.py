@@ -181,19 +181,53 @@ def evaluate_saliency_maps_in_folder(
     return results
 
 
+def main(argv=None):
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(description="Evaluate saved ERP saliency maps")
+    parser.add_argument("--dataset_name", default="AVS-ODV",
+                        choices=["AVS-ODV", "SVGC_AVA", "Sports-360", "VR-EyeTracking"])
+    parser.add_argument("--dataset_root_dir")
+    parser.add_argument("--saliency_folder",
+                        help="directory containing <video_id>/<frame>.png predictions")
+    parser.add_argument("--dataset_split", type=int, default=1)
+    parser.add_argument("--seq_length", type=int, default=12,
+                        help="must match the inference clip length for VR-EyeTracking")
+    args = parser.parse_args(argv)
+    ground_truth_root = args.dataset_root_dir or str(
+        Path("/home/dyz/PythonProject/Dataset") / args.dataset_name
+    )
+    saliency_folder = args.saliency_folder or str(
+        Path("/home/dyz/PythonProject/DataSet_Output") / args.dataset_name
+        / "Results/Results_Oth/Saliency/SphereUformer-split-2/saliency_png"
+    )
+    expected_frames = None
+    if args.dataset_name == "VR-EyeTracking":
+        if args.dataset_split != 1:
+            parser.error("VR-EyeTracking provides only dataset_split=1")
+        project_root = str(Path(__file__).resolve().parent.parent)
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        from data.DataLoader360Video import SaliencyDataset
+
+        dataset = SaliencyDataset(
+            dataname=args.dataset_name,
+            root_dir=ground_truth_root,
+            video_id=_test_video_ids(ground_truth_root, 1, args.dataset_name),
+            dataset_kwargs={
+                "sphere_rank": 1, "sphere_node_type": "vertex",
+                "seq_length": args.seq_length,
+            },
+            data_type="test",
+            include_partial=True,
+        )
+        expected_frames = list(dataset.iter_expected_frames())
+    return evaluate_saliency_maps_in_folder(
+        saliency_folder, ground_truth_root, args.dataset_name,
+        dataset_split=args.dataset_split, expected_frames=expected_frames,
+    )
+
+
 if __name__ == "__main__":
-    dataset_name = "AVS-ODV"
-    model = "SphereUformer-split-2"
-    saliency_root = (
-        "/home/dyz/PythonProject/DataSet_Output/"
-        + dataset_name
-        + "/Results/Results_Oth/Saliency/"
-        + model
-        + "/saliency_png"
-    )
-    ground_truth_folder = "/home/dyz/PythonProject/Dataset/" + dataset_name
-    evaluate_saliency_maps_in_folder(
-        saliency_root,
-        ground_truth_folder,
-        dataset_name,
-    )
+    main()

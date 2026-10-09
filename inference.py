@@ -11,7 +11,6 @@ EVALUATE_DIR = os.path.join(os.path.dirname(__file__), "evaluate")
 if EVALUATE_DIR not in sys.path:
     sys.path.insert(0, EVALUATE_DIR)
 
-from adaptive_diagnostics import UAHSDiagnosticsAccumulator
 from data.get_saliency_dataloaders import get_dataloaders, resolve_dataset_split
 from evaluation import evaluate_saliency_maps_in_folder
 from network.sphere_model import build_saliency_model
@@ -44,28 +43,17 @@ class InferenceRunner:
             dataset_split=args.dataset_split,
         )
 
-        # Inference accepts the unchanged baseline and final UAHS checkpoints.
+        # Inference accepts the baseline or the matching L4-ablation checkpoint.
         args.use_checkpoint = False
         self.model = build_saliency_model(args)
         self._load_weights(args.base_model_weights)
         self.model.to(self.device).eval()
-        if args.uahs_diagnostics and args.model_type != "uahs":
-            raise ValueError("--uahs_diagnostics requires --model_type uahs")
-        if args.model_type == "uahs" and not (
-                0 <= args.target_refine_ratio_l2
-                <= args.target_refine_ratio_l1 <= 1
-        ):
-            raise ValueError(
-                "UAHS requires 0 <= target_refine_ratio_l2 "
-                "<= target_refine_ratio_l1 <= 1"
-            )
         if args.uahs_diagnostics:
-            self.uahs_diagnostics = UAHSDiagnosticsAccumulator(
-                args.target_refine_ratio_l1,
-                args.target_refine_ratio_l2,
+            raise ValueError(
+                "--uahs_diagnostics is unavailable for the L4-only ablation "
+                "because uncertainty and routing modules were removed"
             )
-        else:
-            self.uahs_diagnostics = None
+        self.uahs_diagnostics = None
 
         sphere_ref = IcoSphereRef(args.mode)
         spherical = asSpherical(sphere_ref.get_normals(rank=args.img_rank))
@@ -90,15 +78,32 @@ class InferenceRunner:
             (key[7:] if key.startswith("module.") else key): value
             for key, value in state_dict.items()
         }
-        try:
-            self.model.load_state_dict(state_dict, strict=True)
-        except RuntimeError as error:
+        model_state = self.model.state_dict()
+        shape_mismatches = [
+            key for key, value in state_dict.items()
+            if key in model_state and value.shape != model_state[key].shape
+        ]
+        compatible_state = {
+            key: value for key, value in state_dict.items()
+            if key in model_state and value.shape == model_state[key].shape
+        }
+        missing = [
+            key for key in model_state
+            if key not in compatible_state
+        ]
+        unexpected = [
+            key for key in state_dict
+            if key not in model_state
+        ]
+        if missing or unexpected or shape_mismatches:
             raise RuntimeError(
-                "Checkpoint does not exactly match the fixed-budget model with "
-                "spatial-only sparse refinement. Use a checkpoint trained with the "
-                "current architecture."
-            ) from error
-        print(f"Loaded {len(state_dict)} model tensors from {path}")
+                "Checkpoint does not match the selected model: "
+                f"missing={missing}, unexpected={unexpected}, "
+                f"shape_mismatches={shape_mismatches}"
+            )
+        model_state.update(compatible_state)
+        self.model.load_state_dict(model_state, strict=True)
+        print(f"Loaded {len(compatible_state)} model tensors from {path}")
 
     def _to_device(self, batch):
         return {
@@ -115,6 +120,9 @@ class InferenceRunner:
                 device=self.device,
                 dtype=torch.float32,
             )
+            # Match grid_sample(..., align_corners=False): normalized ERP
+            # coordinates refer to pixel edges. Longitude is periodic, while
+            # latitude is clamped at the poles.
             pixel_coords = (self.normals_wh + 1) * image_size / 2 - 0.5
             x, y = pixel_coords[:, 0], pixel_coords[:, 1]
             x0_unwrapped = x.floor().long()
@@ -154,10 +162,7 @@ class InferenceRunner:
         return result / weights.clamp_min(1e-8)
 
     def _save_predictions(self, batch, predictions):
-        height, width = (
-            batch["erp_sal"].shape[-2:]
-            if self.args.dataset_name == "VR-EyeTracking" else (128, 256)
-        )
+        height, width = 128, 256
         valid_lengths = batch["valid_length"].tolist()
         paths_by_time = batch["seq_path"]
         for sample_idx, valid_length in enumerate(valid_lengths):
@@ -284,8 +289,14 @@ class InferenceRunner:
             "local_motion_blocks": 2,
             "global_content_blocks": 1,
             "global_query_chunk_size": self.args.global_query_chunk_size,
-            "target_refine_ratio_l1": self.args.target_refine_ratio_l1,
-            "target_refine_ratio_l2": self.args.target_refine_ratio_l2,
+            "initial_budget_l5": self.args.target_refine_ratio_l1,
+            "initial_budget_l6": self.args.target_refine_ratio_l2,
+            "budget_l5_min": self.args.budget_l5_min,
+            "budget_l5_max": self.args.budget_l5_max,
+            "budget_error_threshold_l4": self.args.budget_error_threshold_l4,
+            "budget_error_threshold_l5": self.args.budget_error_threshold_l5,
+            "budget_error_temperature_l4": self.args.budget_error_temperature_l4,
+            "budget_error_temperature_l5": self.args.budget_error_temperature_l5,
             "max_batches": self.args.max_batches,
             "routing": "uncertainty_only",
         }
@@ -383,7 +394,7 @@ def main():
     parser.add_argument(
         "--uahs_diagnostics",
         action="store_true",
-        help="collect UAHS uncertainty, selector, hierarchy, and efficiency statistics",
+        help="unsupported legacy option (uncertainty/routing were ablated)",
     )
     parser.add_argument(
         "--diagnostics_output",
@@ -420,22 +431,20 @@ def main():
         print("\nERP evaluation skipped in --metrics_only mode")
     else:
         print("\n========== ERP Metrics ==========")
-        if args.dataset_name in {
-            "AVS-ODV", "SVGC_AVA", "Sports-360", "VR-EyeTracking"
-        }:
+        if args.dataset_name in {"AVS-ODV", "SVGC_AVA", "Sports-360", "VR-EyeTracking"}:
             ground_truth_dir = args.dataset_root_dir
         else:
             ground_truth_dir = os.path.join(args.dataset_root_dir, "testing")
         try:
-            expected_frames = None
-            if args.dataset_name == "VR-EyeTracking":
-                expected_frames = list(runner.loader_test.dataset.iter_expected_frames())
             evaluate_saliency_maps_in_folder(
                 args.output_dir,
                 ground_truth_dir,
                 args.dataset_name,
                 dataset_split=args.dataset_split,
-                expected_frames=expected_frames,
+                expected_frames=(
+                    list(runner.loader_test.dataset.iter_expected_frames())
+                    if args.dataset_name == "VR-EyeTracking" else None
+                ),
             )
         except Exception as error:
             print(f"ERP evaluation failed: {error}")
@@ -450,89 +459,64 @@ if __name__ == "__main__":
     main()
 
 """
-CUDA_VISIBLE_DEVICES=0 python /home/dyz/PythonProject/Test_Codes/Sampling_test/inference.py \
+CUDA_VISIBLE_DEVICES=0 python /home/dyz/PythonProject/Test_Codes/sports_test/inference.py \
     --model_type uahs \
-    --dataset_name Sports-360 \
-    --dataset_root_dir /home/dyz/PythonProject/Dataset/Sports-360 \
-    --base_model_weights /home/dyz/PythonProject/Test_Codes/Sampling_test/log/uahs-sports360/models/Epoch_16model.pth \
+     --dataset_name Sports-360 \
+    --dataset_split 1 \
+    --base_model_weights /home/dyz/PythonProject/Test_Codes/sports_test/log/l4-attention-ablation-center/models/Epoch_24model.pth \
     --output_dir /home/dyz/PythonProject/DataSet_Output/Sports-360 \
-    --method_name UAHS \
+    --method_name L4-Attention-Ablation \
     --mode vertex \
     --img_rank 6 \
     --seq_length 12 \
     --temporal_window_radius none \
-    --coarse_pool_type mean_max \
-    --target_refine_ratio_l1 0.25 \
-    --target_refine_ratio_l2 0.125 \
+    --coarse_pool_type center \
     --global_query_chunk_size 128 \
     --hard_selection_warmup_epochs 0 \
     --val_batch_size 1 \
     --num_workers 8
 
-Epoch_19model.pth
-Average AUC-J: 0.9393917207819846
-Average NSS: 4.352907229021671
-Average KL Divergence: 1.519692052329333
-Average SIM: 0.49430964606576533
-Average CC: 0.6805210023252716
 
+
+
+#仅有L4的消融-SD360 使用面片聚合下采样
+Average AUC-J: 0.9368516915728922
+Average NSS: 4.526369612470469
+Average KL Divergence: 1.801704825559961
+Average SIM: 0.4896125598862012
+Average CC: 0.6797730937481422
 ========== Final Sphere Metrics ==========
-AUC: 0.916551
-NSS: 3.533594
-CC: 0.673241
-SIM: 0.494356
-KL: 0.931639
+AUC: 0.915887
+NSS: 3.678026
+CC: 0.672440
+SIM: 0.490338
+KL: 0.959589
 
-固定没有时序Epoch_23model.pth
-Average AUC-J:  0.937521769574947
-Average NSS:  4.412018399251346
-Average KL Divergence:  1.7768851609713057
-Average SIM:  0.5015052475896234
-Average CC:  0.6788409644269828
+
+SD360使用 顶点直接 center下采样
+Average AUC-J: 0.935708058716498
+Average NSS: 4.217996950273042
+Average KL Divergence: 1.634857966653918
+Average SIM: 0.4684681390533448
+Average CC: 0.6596047983907627
 ========== Final Sphere Metrics ==========
-AUC: 0.921984
-NSS: 3.695533
-CC: 0.671711
-SIM: 0.501339
-KL: 0.943755
+AUC: 0.910495
+NSS: 3.422115
+CC: 0.651101
+SIM: 0.468896
+KL: 1.001098
 
-固定有时序（并行的时序）
-Average AUC-J: 0.9365697362429501
-Average NSS: 4.341692525630977
-Average KL Divergence: 1.782136573923026
-Average SIM: 0.49932939239905905
-Average CC: 0.6725464188561614
+
+#AVS-ODV 使用面片聚合下采样
+Average AUC-J: 0.928836699838862
+Average NSS: 3.5800890857412755
+Average KL Divergence: 2.4890445043147316
+Average SIM: 0.4262010014035914
+Average CC: 0.5565158618521814
 ========== Final Sphere Metrics ==========
-AUC: 0.914888
-NSS: 3.514117
-CC: 0.664969
-SIM: 0.499867
-KL: 0.947610
-固定有时序，串行时序
-Average AUC-J: 0.9391868470929271
-Average NSS: 4.624895661611048
-Average KL Divergence: 1.6131632652817107
-Average SIM: 0.5028944701708726
-Average CC: 0.6897564880938658
-========== Final Sphere Metrics ==========
-AUC: 0.917292
-NSS: 3.758404
-CC: 0.682759
-SIM: 0.502749
-KL: 0.926140
-
-
-动态调整预算大小Epoch_21model.pth
-Average AUC-J:  0.9396596347750381
-Average NSS:  4.5120151906079515
-Average KL Divergence:  1.4603340075494593
-Average SIM:  0.4938410525639292
-Average CC:  0.6852996642027537
-
-========== Final Sphere Metrics ==========
-AUC: 0.922739
-NSS: 3.789492
-CC: 0.678706
-SIM: 0.494472
-KL: 0.931123
+AUC: 0.926642
+NSS: 2.893854
+CC: 0.550664
+SIM: 0.434157
+KL: 1.161040
 """

@@ -1,102 +1,122 @@
-# UAHS — Uncertainty-guided Adaptive Hierarchical Sphere
+# L4 Attention Ablation — Sports-360 Saliency
 
-This repository contains the published `SphereUFormer` baseline and the final
-UAHS model for 360° video saliency prediction. UAHS maps rank-6 RGB video to a
-rank-6 spherical saliency map `[B, T, 40962]` through six components:
+This project is an ablation copy of `Sampling_test`. The `uahs` model keeps
+only the rank-4 attention backbone:
 
-1. local motion-aware spherical modeling at rank 4 (two blocks);
-2. true full-sphere, content-aware reasoning at rank 4 (one block);
-3. learned Laplace uncertainty at ranks 4 and 5;
-4. uncertainty-ranked hard spherical-area selection at fixed configured ratios;
-5. selected-query sparse spatial refinement at ranks 5 and 6; and
-6. rank-4/rank-5/rank-6 multi-exit reconstruction.
+1. project the rank-6 RGB input and pool it directly to rank 4;
+2. run exactly two local motion-aware attention blocks at rank 4;
+3. run one full-sphere global spatio-temporal attention block at rank 4;
+4. interpolate the rank-4 **features** to rank 5 and then rank 6; and
+5. apply the only saliency output head at rank 6.
 
-The rank-5 and rank-6 refiners gather only selected query vertices and their
-fixed spherical neighbors. They do not run dense high-resolution spatial
-attention. Temporal attention remains in the rank-4 coarse backbone only.
-Upsampling supplies context only; fine detail is pooled/projected
-from the original rank-6 observation. With `--abs_pos_enc_in 1` (the default),
-independent input position encodings are added at ranks 4, 5, and 6 before
-coarse modeling or sparse refinement. Fine-level spatial attention also uses
-its own positional Q/K encoding and relative bias.
+There is no L4 saliency head, rank-5/rank-6 attention, uncertainty estimation,
+hard routing, dynamic budget, or auxiliary loss. Training supervises only the
+final rank-6 saliency map `[B, T, 40962]` when `--img_rank 6` is used.
 
 ## Training
 
-The final model is selected with `--model_type uahs` (the default):
-
 ```bash
-CUDA_VISIBLE_DEVICES=0 python train.py \
-  --model_type uahs --dataset_name Sports-360 \
-  --dataset_root_dir /path/to/Sports-360 \
-  --img_rank 6 --seq_length 12 --temporal_window_radius none \
-  --train_batch_size 1 --val_batch_size 1 \
-  --target_refine_ratio_l1 0.25 --target_refine_ratio_l2 0.125
+CUDA_VISIBLE_DEVICES=0 python /home/dyz/PythonProject/Test_Codes/sports_test/train.py \
+  --model_type uahs \
+  --dataset_name Sports-360 \
+  --dataset_root_dir /home/dyz/PythonProject/Dataset/Sports-360 \
+  --mode vertex \
+  --img_rank 6 \
+  --seq_length 12 \
+  --temporal_window_radius none \
+  --coarse_pool_type mean_max \
+  --global_query_chunk_size 128 \
+  --train_batch_size 1 \
+  --val_batch_size 1 \
+  --num_workers 8 \
+  --num_epochs 100 \
+  --optimizer adamw \
+  --learning_rate 1e-4 \
+  --min_learning_rate 1e-6 \
+  --warmup_epochs 3 \
+  --lr_scheduler warmup_cosine \
+  --weight_decay 1e-4 \
+  --use_checkpoint 1 \
+  --accum_grads 1 \
+  --exp_name l4-attention-ablation-sports360 \
+  --log_dir /home/dyz/PythonProject/Test_Codes/sports_test/log/l4-attention-ablation-sports360 \
+  --tensorboard_log_dir /home/dyz/PythonProject/log/tensorboard/l4-attention-ablation-sports360
 ```
 
-Use `--model_type sphere_uformer` for the unchanged baseline. Run
-`python train.py --help` for loss weights and optimization options.
+`--model_type sphere_uformer` still selects the copied, unchanged baseline.
+The legacy uncertainty/budget CLI options remain accepted for command-line
+compatibility but do not create modules or contribute losses in this ablation.
 
-The two `target_refine_ratio` values are fixed global spherical-area budgets.
-Uncertainty ranks each hard selector; labels never enter `forward()`. At ranks 5
-and 6, only selected spatial queries are refined.
-
-Earlier fixed- or dynamic-budget checkpoints can initialize compatible shared
-training weights. Direct inference requires a checkpoint trained with the
-current architecture.
-
-### VR-EyeTracking
-
-Use the dataset's `train_list.txt` and `test_list.txt` with the shared
-`videos/<video_id>`, `maps/<video_id>/<frame>.png`, and
-`fixation/<video_id>/<frame>.png` layout. Frame numbers are zero-based. A clip
-is skipped if any of its frames lacks either annotation; later clips retain
-their original video-frame indices. Inference pads a final short clip for the
-model and writes predictions only for its real frames. On first use, the loader
-scans each video once to index decoded-frame timestamps (cached under
-`~/.cache/uahs/vr_frame_pts`); this corrects OpenCV seek offsets without
-extracting or storing full-resolution frames.
+## Inference
 
 ```bash
-python train.py --model_type uahs --dataset_name VR-EyeTracking \
-  --dataset_root_dir /path/to/VR-EyeTracking --img_rank 6 --seq_length 12
-
-python inference.py --model_type uahs --dataset_name VR-EyeTracking \
-  --dataset_root_dir /path/to/VR-EyeTracking \
-  --base_model_weights /path/to/uahs.pth \
-  --output_dir /path/to/predictions --img_rank 6 --seq_length 12
+CUDA_VISIBLE_DEVICES=0 python /home/dyz/PythonProject/Test_Codes/sports_test/inference.py \
+  --model_type uahs \
+  --dataset_name Sports-360 \
+  --dataset_root_dir /home/dyz/PythonProject/Dataset/Sports-360 \
+  --base_model_weights /path/to/l4_ablation_checkpoint.pth \
+  --output_dir /home/dyz/PythonProject/DataSet_Output/Sports-360 \
+  --method_name L4-Attention-Ablation \
+  --mode vertex \
+  --img_rank 6 \
+  --seq_length 12 \
+  --temporal_window_radius none
 ```
 
-Prediction PNG names preserve the annotation frame numbers and use the
-annotation image dimensions. With `--save_mat`, `frame_indices` in each MAT
-file identifies the source video frame for every stored prediction.
+Inference requires a checkpoint matching this ablation architecture. A full
+UAHS checkpoint is intentionally rejected because it contains removed heads
+and refinement modules. Training can still use `--base_model_weights` to load
+only shape-compatible parameters as initialization.
 
 ## Verification
 
-Run geometry, fixed-budget, sparse-equivalence, no-label-leak, gradient, and
-baseline regression tests:
-
 ```bash
+python -m compileall .
 /home/dyz/anaconda3/envs/sphereformer/bin/python smoke_test_uahs.py
 ```
 
-Run the real V100 FP32 preflight (`B=1`, `T=12`, rank 4→5→6, three optimizer
-steps) and write its memory/timing report:
+## VR-EyeTracking
+
+Run the following commands from this project directory. The loader reads
+`train_list.txt` and `test_list.txt` (only `--dataset_split 1`).
+The official 134 training videos are split into 107 training and 27 validation
+videos; the 74 test videos remain held out.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 /home/dyz/anaconda3/envs/sphereformer/bin/python \
-  preflight_uahs.py --output log/uahs_spatial_only_preflight.json
+python train.py --model_type uahs --dataset_name VR-EyeTracking \
+  --dataset_root_dir /home/dyz/PythonProject/Dataset/VR-EyeTracking \
+  --dataset_split 1 --img_rank 6 --seq_length 12 \
+  --log_dir /path/to/vr-training-log
+
+python inference.py --model_type uahs --dataset_name VR-EyeTracking \
+  --dataset_root_dir /home/dyz/PythonProject/Dataset/VR-EyeTracking \
+  --dataset_split 1 --img_rank 6 --seq_length 12 \
+  --base_model_weights /path/to/this-project-checkpoint.pth \
+  --output_dir /path/to/vr-predictions --save_mat
 ```
 
-## Evaluation and Diagnostics
+Video frames, maps and fixations are matched by the original zero-based frame
+number. A clip missing either annotation is skipped without renumbering later
+clips. Sequential decode timestamps verify random seeks; the first run builds
+a small index cache under `~/.cache/uahs/vr_frame_pts` (or `XDG_CACHE_HOME`).
+No full-resolution frames are cached.
+
+Training/validation use complete clips. Test/inference pad a final short clip
+but count and save only its real frames. PNGs retain source frame names and
+are reconstructed at a fixed width of 256 and height of 128; MAT files contain
+`frame_indices` alongside `salmap`.
+Use checkpoints for this project's own model architecture.
+
+`train.py --test --base_model_weights ...` reports sphere metrics on real test
+frames only. `inference.py` additionally saves predictions and computes ERP
+metrics. To evaluate existing PNGs independently, supply the actual
+`saliency_png` directory and the same clip length used for inference:
 
 ```bash
-python inference.py --model_type uahs \
-  --base_model_weights /path/to/uahs.pth \
-  --dataset_root_dir /path/to/Sports-360 --metrics_only \
-  --uahs_diagnostics
+python evaluate/evaluation.py --dataset_name VR-EyeTracking \
+  --dataset_root_dir /home/dyz/PythonProject/Dataset/VR-EyeTracking \
+  --saliency_folder /path/to/saliency_png --seq_length 12
 ```
 
-Diagnostics include uncertainty calibration/correlation, selector
-IoU/precision/recall, hierarchical KL, exact selected spherical area, active
-vertices/queries, estimated refinement work, and the final uncertainty-routing
-metrics. Inference always evaluates only the formal uncertainty route.
+Run the frame alignment, missing-label, padding and evaluation regressions with
+`python -m unittest -q test_vr_eyetracking_loader`.

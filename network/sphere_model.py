@@ -792,7 +792,7 @@ class SphericalUncertaintyHead(nn.Module):
 
 
 def build_saliency_model(args, node_type: Optional[str] = None) -> nn.Module:
-    """Build the published baseline or final UAHS model."""
+    """Build the published baseline or the L4-only attention ablation."""
     node_type = node_type or args.mode
     common = dict(
         img_rank=args.img_rank,
@@ -839,10 +839,7 @@ def build_saliency_model(args, node_type: Optional[str] = None) -> nn.Module:
     return UAHS(
         num_heads=args.enc_num_heads[0],
         coarse_pool_type=getattr(args, "coarse_pool_type", "mean_max"),
-        target_refine_ratio_l1=args.target_refine_ratio_l1,
-        target_refine_ratio_l2=args.target_refine_ratio_l2,
         global_query_chunk_size=args.global_query_chunk_size,
-        hard_selection_warmup_epochs=args.hard_selection_warmup_epochs,
         return_aux=args.return_aux,
         debug_uahs=args.debug_uahs,
         **common,

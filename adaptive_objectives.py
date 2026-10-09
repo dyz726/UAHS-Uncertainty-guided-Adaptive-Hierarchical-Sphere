@@ -4,6 +4,107 @@ import torch
 
 
 @torch.no_grad()
+def build_error_supervised_risk(
+        target,
+        prediction,
+        error_threshold,
+        error_temperature,
+):
+    """Build per-face soft refinement demand from detached prediction error."""
+    if target.shape != prediction.shape:
+        raise ValueError("target and prediction must have identical shapes")
+    if error_temperature <= 0:
+        raise ValueError("error_temperature must be positive")
+    residual = (target - prediction.detach()).abs()
+    return torch.sigmoid(
+        (residual - float(error_threshold)) / float(error_temperature)
+    )
+
+
+@torch.no_grad()
+def build_error_supervised_budget(
+        target,
+        prediction,
+        face_areas,
+        error_threshold,
+        error_temperature,
+        eligible_mask=None,
+):
+    """Build an area-weighted soft refinement demand from prediction error.
+
+    The denominator is always the complete sphere. When ``eligible_mask`` is
+    supplied, only eligible faces contribute to the numerator; consequently a
+    child-stage target cannot request area outside its parent-stage region.
+    """
+    if target.shape[-1] != face_areas.numel():
+        raise ValueError("target and face_areas have different face counts")
+    demand = build_error_supervised_risk(
+        target,
+        prediction,
+        error_threshold,
+        error_temperature,
+    )
+    if eligible_mask is not None:
+        if eligible_mask.shape != demand.shape:
+            raise ValueError("eligible_mask must have the same shape as target")
+        demand = demand * eligible_mask.detach().to(demand.dtype)
+    areas = face_areas.to(device=demand.device, dtype=demand.dtype)
+    return (demand * areas).sum(dim=-1) / areas.sum()
+
+
+@torch.no_grad()
+def area_weighted_calibration_error(
+        prediction,
+        target,
+        face_areas,
+        eligible_mask=None,
+        num_bins=10,
+        epsilon=1e-8,
+):
+    """Return spherical-area-weighted ECE for local refinement risk."""
+    if prediction.shape != target.shape:
+        raise ValueError("prediction and target must have identical shapes")
+    if prediction.shape[-1] != face_areas.numel():
+        raise ValueError("prediction and face_areas have different face counts")
+    if num_bins <= 0:
+        raise ValueError("num_bins must be positive")
+
+    prediction = prediction.detach()
+    target = target.detach().to(
+        device=prediction.device, dtype=prediction.dtype
+    )
+    areas = face_areas.to(device=prediction.device, dtype=prediction.dtype)
+    weights = areas.reshape(*([1] * (prediction.ndim - 1)), -1)
+    weights = weights.expand_as(prediction)
+    if eligible_mask is not None:
+        if eligible_mask.shape != prediction.shape:
+            raise ValueError("eligible_mask must match prediction")
+        weights = weights * eligible_mask.detach().to(weights.dtype)
+    flat_prediction = prediction.reshape(-1)
+    flat_target = target.reshape(-1)
+    flat_weights = weights.reshape(-1)
+    bin_indices = torch.clamp(
+        (prediction.clamp(0, 1) * num_bins).long(),
+        max=num_bins - 1,
+    ).reshape(-1)
+    bin_weights = prediction.new_zeros(num_bins).scatter_add_(
+        0, bin_indices, flat_weights
+    )
+    prediction_totals = prediction.new_zeros(num_bins).scatter_add_(
+        0, bin_indices, flat_prediction * flat_weights
+    )
+    target_totals = prediction.new_zeros(num_bins).scatter_add_(
+        0, bin_indices, flat_target * flat_weights
+    )
+    denominator = bin_weights.clamp_min(epsilon)
+    bin_error = (
+        prediction_totals / denominator - target_totals / denominator
+    ).abs()
+    total_weight = bin_weights.sum().clamp_min(epsilon)
+    return (bin_weights / total_weight * bin_error).sum()
+
+
+@torch.no_grad()
 def build_fixed_area_target(
         scores,
         face_areas,
@@ -147,3 +248,58 @@ def per_frame_spearman(first, second, epsilon=1e-8):
     return torch.where(
         defined, correlation.clamp(-1, 1), torch.full_like(correlation, float("nan"))
     )
+
+
+@torch.no_grad()
+def budget_regression_metrics(prediction, target, epsilon=1e-12):
+    """Summarize paired per-frame budget predictions and targets."""
+    if prediction.numel() != target.numel():
+        raise ValueError("prediction and target must contain the same number of values")
+    prediction = prediction.detach().reshape(-1).to(dtype=torch.float64)
+    target = target.detach().reshape(-1).to(
+        device=prediction.device, dtype=torch.float64
+    )
+    finite = torch.isfinite(prediction) & torch.isfinite(target)
+    prediction, target = prediction[finite], target[finite]
+    if prediction.numel() == 0:
+        raise ValueError("budget diagnostics require at least one finite pair")
+
+    difference = prediction - target
+    centered_prediction = prediction - prediction.mean()
+    centered_target = target - target.mean()
+    pearson_denominator = torch.sqrt(
+        centered_prediction.square().sum() * centered_target.square().sum()
+    )
+    if float(pearson_denominator) <= epsilon:
+        pearson = float("nan")
+    else:
+        pearson = float(
+            (centered_prediction * centered_target).sum()
+            / pearson_denominator
+        )
+    spearman = float(per_frame_spearman(
+        prediction.unsqueeze(0), target.unsqueeze(0), epsilon=epsilon
+    ).squeeze(0))
+    quantiles = prediction.new_tensor((0.1, 0.5, 0.9))
+    prediction_quantiles = torch.quantile(prediction, quantiles)
+    target_quantiles = torch.quantile(target, quantiles)
+
+    return {
+        "pred_mean": float(prediction.mean()),
+        "pred_std": float(prediction.std(unbiased=False)),
+        "target_mean": float(target.mean()),
+        "target_std": float(target.std(unbiased=False)),
+        "mae": float(difference.abs().mean()),
+        "rmse": float(difference.square().mean().sqrt()),
+        "pearson": pearson,
+        "spearman": spearman,
+        "under_budget_ratio": float((prediction < target).to(torch.float64).mean()),
+        "pred_p10": float(prediction_quantiles[0]),
+        "pred_p50": float(prediction_quantiles[1]),
+        "pred_p90": float(prediction_quantiles[2]),
+        "target_p10": float(target_quantiles[0]),
+        "target_p50": float(target_quantiles[1]),
+        "target_p90": float(target_quantiles[2]),
+        "finite_count": int(prediction.numel()),
+        "nonfinite_count": int((~finite).sum()),
+    }
