@@ -4,7 +4,6 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from timm.models.layers import trunc_normal_
 from torch import Tensor
 
@@ -54,9 +53,9 @@ class HardAreaSelector(nn.Module):
 class UAHS(nn.Module):
     """Global-aware coarse modeling with truly sparse hierarchical refinement.
 
-    Expensive rank-5/rank-6 spatial attention and FFNs are evaluated only for
-    vertices incident to hard-selected child faces. Dense fine tensors are kept
-    solely as the reconstruction canvas and as K/V feature sources.
+    Expensive rank-5/rank-6 spatial attention and FFNs are evaluated
+    only for vertices incident to hard-selected child faces. Dense fine tensors
+    are kept solely as the reconstruction canvas and as K/V feature sources.
     """
 
     SELECTOR_MODES = {
@@ -381,7 +380,7 @@ class UAHS(nn.Module):
         """Predict saliency without labels; overrides are evaluation-only masks.
 
         ``disable_l6_refinement`` is an evaluation-only ablation. It preserves
-        the uncertainty-based L4/L5 routing, dense L5 representation, L5->L6 base
+        uncertainty-based fixed-budget routing, dense L5 representation, L5->L6 base
         reconstruction, fusion normalization, and final output head, while
         skipping only the selected-query rank-6 residual computation.
         """

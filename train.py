@@ -31,21 +31,22 @@ parser.add_argument("--num_workers", type=int, default=8, help="number of datalo
                
 parser.add_argument("--task", type=str, default="salient", choices=["salient"])
 parser.add_argument("--dataset_name", type=str, default="Sports-360",
-                    choices=["Sports-360", "AVS-ODV", "SVGC_AVA"])
+                    choices=["Sports-360", "AVS-ODV", "SVGC_AVA", "VR-EyeTracking"])
 parser.add_argument(
     "--dataset_root_dir",
     type=str,
     default=None,
-    help="dataset root containing training, testing, and videos; "
+    help="dataset root containing videos and annotations/split files; "
          "defaults to /home/dyz/PythonProject/Dataset/<dataset_name>",
 )
 parser.add_argument(
-    "--avs_split",
+    "--dataset_split",
     type=int,
     default=1,
     choices=[1, 2, 3],
-    help="AVS-ODV 数据集划分方式编号，使用 train_list_N.txt / test_list_N.txt；"
-         "仅在 --dataset_name 为 AVS-ODV 时生效",
+    help="数据集划分方式编号；VR-EyeTracking 使用 train_list.txt / "
+         "test_list.txt 且只提供划分 1；编号 3 仅对 AVS-ODV 生效，"
+         "SVGC_AVA/Sports-360 选择 3 时使用默认划分 1",
 )
 parser.add_argument("--seq_length", type=int, default=12)
 
@@ -149,14 +150,6 @@ parser.add_argument(
 )
 
                             
-parser.add_argument("--disable_color_augmentation",  dest="color_augmentation", action="store_false",
-                    help="if set, do not use color augmentation")
-parser.add_argument("--disable_lr_flip_augmentation", dest="lr_flip_augmentation", action="store_false",
-                    help="if set, do not use left-right flipping augmentation")
-parser.add_argument("--disable_yaw_rotation_augmentation", dest="yaw_rotation_augmentation", action="store_false",
-                    help="if set, do not use yaw rotation augmentation")
-
-                
 parser.add_argument("--exp_name", default="train_sphereuformer", type=str)
 parser.add_argument("--log_dir", default="log",type=str, help="models directory")
 parser.add_argument("--wandb_entity", type=str)
@@ -169,6 +162,16 @@ parser.add_argument("--test", action="store_true")
 
 def main():
     args = parser.parse_args()
+
+    from data.get_saliency_dataloaders import resolve_dataset_split
+
+    effective_split = resolve_dataset_split(args.dataset_name, args.dataset_split)
+    if effective_split != args.dataset_split:
+        print(
+            f"{args.dataset_name} does not provide split {args.dataset_split}; "
+            f"using split {effective_split} instead"
+        )
+        args.dataset_split = effective_split
 
                                           
     if args.dataset_root_dir is None:
@@ -195,7 +198,7 @@ if __name__ == "__main__":
     main()
 
 """
- CUDA_VISIBLE_DEVICES=4 \
+ CUDA_VISIBLE_DEVICES=0 \
   python /home/dyz/PythonProject/Test_Codes/Sampling_test/train.py \
     --model_type uahs \
     --dataset_name Sports-360 \
@@ -204,15 +207,11 @@ if __name__ == "__main__":
     --img_rank 6 \
     --seq_length 12 \
     --temporal_window_radius none \
+    --rel_pos_init_variance 0 \
     --coarse_pool_type mean_max \
+    --global_query_chunk_size 128 \
     --target_refine_ratio_l1 0.25 \
     --target_refine_ratio_l2 0.125 \
-    --global_query_chunk_size 128 \
-    --hard_selection_warmup_epochs 0 \
-    --lambda_saliency_l4 0.15 \
-    --lambda_saliency_l5 0.15 \
-    --lambda_uncertainty_l4 0.05 \
-    --lambda_uncertainty_l5 0.05 \
     --train_batch_size 1 \
     --val_batch_size 1 \
     --num_workers 8 \
@@ -225,7 +224,13 @@ if __name__ == "__main__":
     --weight_decay 1e-4 \
     --use_checkpoint 1 \
     --accum_grads 1 \
-    --exp_name uahs-v3-sports360 \
-    --log_dir /home/dyz/PythonProject/Test_Codes/Sampling_test/log/uahs-v3-sports360 \
-    --tensorboard_log_dir /home/dyz/PythonProject/log/tensorboard/uahs
+    --exp_name uahs \
+    --log_dir /home/dyz/PythonProject/Test_Codes/Sampling_test/log/uahs-V2 \
+    --tensorboard_log_dir /home/dyz/PythonProject/log/tensorboard/uahs-V2
+
+
+conda run -n sphereformer tensorboard \
+      --logdir=/home/dyz/PythonProject/log/tensorboard \
+      --host 0.0.0.0 \
+      --port 6006
 """

@@ -7,6 +7,7 @@ import tqdm
 import wandb              
 import numpy as np
 import cv2
+import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from data.get_saliency_dataloaders import get_dataloaders         
@@ -14,6 +15,8 @@ from network.sphere_model import build_saliency_model
 from Sphere_SalientScore_torch import *
 from trimesh_utils import *
 EPS = 2.2204e-16
+
+
 class Trainer:
     def __init__(self, args):
         self.args = args
@@ -33,6 +36,7 @@ class Trainer:
             scale_depth=args.scale_depth,
             model_type=args.model_type,
             coarse_pool_type=getattr(args, "coarse_pool_type", "mean_max"),
+            temporal_window_radius=args.temporal_window_radius,
             target_refine_ratio_l1=args.target_refine_ratio_l1,
             target_refine_ratio_l2=args.target_refine_ratio_l2,
             global_query_chunk_size=args.global_query_chunk_size,
@@ -74,16 +78,11 @@ class Trainer:
                 "sphere_node_type": self.config["node_type"],
                 "seq_length": args.seq_length
             },
-            augmentation_kwargs=dict(
-                color_augmentation=False,
-                lr_flip_augmentation=False,
-                yaw_rotation_augmentation=False,
-            ),
             train_batch_size=args.train_batch_size,
             val_batch_size=args.val_batch_size,
             num_workers=args.num_workers,
             pin_memory=False,
-            dataset_split=args.avs_split,
+            dataset_split=args.dataset_split,
         )
                                       
         self.model = build_saliency_model(args, node_type=self.config["node_type"])
@@ -266,20 +265,23 @@ class Trainer:
             pretrained_dict = pretrained_dict["state_dict"]
         source_parameter_count = len(pretrained_dict)
         model_dict = model.state_dict()
-
-                    
-        pretrained_dict = {k: v for k, v in pretrained_dict.items()
-                           if k in model_dict and v.shape == model_dict[k].shape}
-                     
-        match_keys = [k for k, v in pretrained_dict.items() if k in model_dict and v.shape == model_dict[k].shape]
+        compatible_dict = {
+            key: value for key, value in pretrained_dict.items()
+            if key in model_dict and value.shape == model_dict[key].shape
+        }
+        skipped_keys = sorted(set(pretrained_dict) - set(compatible_dict))
+        initialized_keys = sorted(set(model_dict) - set(compatible_dict))
         print(
-            f"Loaded {len(match_keys)}/{len(model_dict)} model tensors "
+            f"Loaded {len(compatible_dict)}/{len(model_dict)} model tensors "
             f"from {source_parameter_count} tensors in {pretrained_path}"
         )
+        if skipped_keys:
+            print(f"Ignored {len(skipped_keys)} incompatible checkpoint tensors")
+        if initialized_keys:
+            print(f"Initialized {len(initialized_keys)} new model tensors")
 
-                 
-        model_dict.update(pretrained_dict)
-        model.load_state_dict(model_dict)
+        model_dict.update(compatible_dict)
+        model.load_state_dict(model_dict, strict=True)
 
         return model
 
@@ -470,7 +472,7 @@ class Trainer:
             if self.writer:
                 self.writer.close()
 
-    def loss_kl_cc(self, pre_sal, gt_sal,gt_fix):
+    def loss_kl(self, pre_sal, gt_sal,gt_fix):
                     
                     
                      
@@ -496,18 +498,18 @@ class Trainer:
         return (values * weights.reshape(1, 1, -1)).sum(dim=-1).mean()
 
     def compute_uahs_losses(self, ground_truth, outputs):
-        """Supervise saliency and predictive uncertainty; labels stay in loss."""
+        """Supervise saliency and uncertainty under fixed refinement budgets."""
         B, T = ground_truth.shape[:2]
         target_l4 = self.model.aggregate_img_values_to_l4_faces(ground_truth)
         target_l5 = self.model.aggregate_img_values_to_l5_faces(ground_truth)
         saliency_l4 = outputs["saliency_l4"]
         saliency_l5 = outputs["saliency_l5"]
-        loss_saliency_l4 = self.loss_kl_cc(
+        loss_saliency_l4 = self.loss_kl(
             saliency_l4.reshape(B * T, -1),
             target_l4.reshape(B * T, -1),
             gt_fix=None,
         ) / (B * T)
-        loss_saliency_l5 = self.loss_kl_cc(
+        loss_saliency_l5 = self.loss_kl(
             saliency_l5.reshape(B * T, -1),
             target_l5.reshape(B * T, -1),
             gt_fix=None,
@@ -689,7 +691,7 @@ class Trainer:
         gt_fix = gt_fix.reshape(B * T, L)
 
                   
-        loss_rec = self.loss_kl_cc(pre_probs, gt_probs,gt_fix)/(B*T)
+        loss_rec = self.loss_kl(pre_probs, gt_probs,gt_fix)/(B*T)
 
         auxiliary_losses = {}
         total_loss = loss_rec

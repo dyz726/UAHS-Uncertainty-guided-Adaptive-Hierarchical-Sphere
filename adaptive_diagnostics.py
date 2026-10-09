@@ -160,7 +160,7 @@ def build_uahs_selection_targets(
         target_ratio_l1,
         target_ratio_l2,
 ):
-    """Build oracle fixed-area targets used only by loss/evaluation."""
+    """Build error-ranked oracle masks at the configured fixed budgets."""
     target_l4 = model.aggregate_img_values_to_l4_faces(ground_truth)
     target_l5 = model.aggregate_img_values_to_l5_faces(ground_truth)
     error_l4 = (target_l4 - outputs["saliency_l4"]).abs()
@@ -198,6 +198,7 @@ class HierarchicalLevelDiagnostics:
         self.error = RunningMoments()
         self.hard_mask = RunningMoments()
         self.area_ratio = RunningMoments()
+        self.area_minus_target = RunningMoments()
         self.uncertainty_error = RunningPairMoments()
         self.spearman = RunningMoments()
         self.selection_iou = RunningMoments()
@@ -219,6 +220,7 @@ class HierarchicalLevelDiagnostics:
         self.error.update(error)
         self.hard_mask.update(hard_mask)
         self.area_ratio.update(area_ratio)
+        self.area_minus_target.update(area_ratio - self.target_ratio)
         self.uncertainty_error.update(uncertainty, error)
         self.calibration.update(uncertainty, error)
         self.spearman.update(per_frame_spearman(uncertainty, error))
@@ -253,11 +255,8 @@ class HierarchicalLevelDiagnostics:
             "hard_mask": self.hard_mask.summary(),
             "actual_refinement_area": {
                 **area_ratio,
-                "target": self.target_ratio,
-                "mean_minus_target": (
-                    None if area_ratio["mean"] is None
-                    else area_ratio["mean"] - self.target_ratio
-                ),
+                "configured_target_ratio": self.target_ratio,
+                "actual_minus_target": self.area_minus_target.summary(),
             },
             "selection": {
                 "iou": self.selection_iou.summary(),

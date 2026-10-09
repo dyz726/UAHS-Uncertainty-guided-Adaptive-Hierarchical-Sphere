@@ -1,116 +1,199 @@
-import os
+from pathlib import Path
+
 import numpy as np
 
+from loadpath import (
+    load_ground_fix_from_png,
+    load_ground_map_from_png,
+    load_saliency_map_from_png,
+)
+from utils_metrics import AUC_Judd, CC, KLD, NSS, SIM
 
-from loadpath import *
-                             
-from utils_metrics import AUC_Judd, AUC_shuffled, CC, NSS, SIM,KLD
 
-def evaluate_saliency_maps_in_folder(saliency_folder, ground_truth_root,DatasetName):
-    """
-    在指定的文件夹中评估所有显著性图
-    :param saliency_folder: 包含显著性图的文件夹路径
-    :param ground_truth_root: 对应的真值文件的根路径(fixation,map)
-    """
-                  
-    auc_j_list = []                  
-    nss_list = []             
-    kl_div_list = []            
-    sim_list = []             
-    cc_list = []            
-    auc_s_list = []                     
-                                                                         
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 
-                       
-    for folder_name in os.listdir(saliency_folder):
-        folder_path = os.path.join(saliency_folder, folder_name)         
 
-                
-        if os.path.isdir(folder_path):
-            print(folder_path)
-            for filename in os.listdir(folder_path):                  
-                if filename.endswith('.png'):             
-                    saliency_path = os.path.join(folder_path, filename)           
-                    if DatasetName in {"Sports-360", "AVS-ODV"}:
-                        name_file = os.path.splitext(filename)[0]           
-                    if DatasetName == "SVGC_AVA":
-                        name_file = os.path.splitext(filename)[0]
-                        name_file = str(int(name_file))
-                    if DatasetName == "VR-EyeTracking":
-                        name_file = os.path.splitext(filename)[0]
-                        name_file = str(int(name_file) - 1)
+def _image_files(directory):
+    if not directory.is_dir():
+        return []
+    return sorted(
+        path
+        for path in directory.iterdir()
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
 
-                    try:
-                                
-                        sal_map = load_saliency_map_from_png(saliency_path)
-                        if sal_map.any() == 0:
-                            continue
-                    except Exception as e:                    
-                        print(f"Error loading saliency map from {saliency_path}: {e}")
-                        continue
 
-                               
-                    ground_map_path = get_ground_map_path(folder_path, name_file, ground_truth_root,DatasetName)
-                    ground_fix_path = get_ground_fix_path(folder_path, name_file, ground_truth_root, DatasetName)
+def _test_video_ids(ground_truth_root, dataset_split, dataset_name):
+    split_name = (
+        "test_list.txt" if dataset_name == "VR-EyeTracking"
+        else f"test_list_{dataset_split}.txt"
+    )
+    split_path = Path(ground_truth_root) / split_name
+    if not split_path.is_file():
+        raise FileNotFoundError(f"{dataset_name} split file not found: {split_path}")
+    with split_path.open("r", encoding="utf-8") as split_file:
+        return [
+            line.strip().split()[0]
+            for line in split_file
+            if line.strip()
+        ]
 
-           
-                    if os.path.exists(ground_map_path) and os.path.exists(ground_fix_path):
-                                                                      
-                        try:
-                            ground_map = load_ground_map_from_png(ground_map_path)         
-                            ground_fix = load_ground_fix_from_png(ground_fix_path)                  
-                        except Exception as e:                   
-                            print(f"Error loading ground truth from {ground_map_path}: {e}")
-                            continue
 
-                              
-                                                               
-                                
-                        auc_j = AUC_Judd(sal_map,ground_fix)
-                        nss=NSS(sal_map,ground_fix)
-                        kl_div=KLD(sal_map,ground_map)
-                        sim=SIM(sal_map,ground_map)
-                        cc=CC(sal_map,ground_map)
-                                                                               
-                                                                             
-                                     
-                                                                                                                                        
-                                                
-                                                                                                
-                                      
-                                            
-                        auc_j_list.append(auc_j)
-                        nss_list.append(nss)
-                        kl_div_list.append(kl_div)
-                        sim_list.append(sim)
-                        cc_list.append(cc)
-                                                 
-                    else:
-                        print(f"Ground truth for {filename} not found, skipping...",ground_map_path,ground_fix_path)
+def _expected_erp_frames(ground_truth_root, dataset_name, dataset_split):
+    """Return expected prediction and annotation paths for a test split."""
+    root = Path(ground_truth_root)
+    expected = []
 
-    if auc_j_list and nss_list and kl_div_list and sim_list and cc_list:
-        print("\nAverage AUC-J: ", np.mean(auc_j_list))
-        print("Average NSS: ", np.mean(nss_list))
-        print("Average KL Divergence: ", np.mean(kl_div_list))
-        print("Average SIM: ", np.mean(sim_list))
-        print("Average CC: ", np.mean(cc_list))
+    if dataset_name == "AVS-ODV":
+        video_ids = _test_video_ids(root, dataset_split, dataset_name)
+        for video_id in video_ids:
+            for ground_map_path in _image_files(root / "maps" / video_id):
+                stem = ground_map_path.stem
+                expected.append(
+                    (
+                        video_id,
+                        stem,
+                        ground_map_path,
+                        root / "fixation" / video_id / f"{stem}fix.png",
+                    )
+                )
+        return expected
+
+    if dataset_name in {"SVGC_AVA", "Sports-360", "VR-EyeTracking"}:
+        video_ids = _test_video_ids(root, dataset_split, dataset_name)
+        for video_id in video_ids:
+            for ground_map_path in _image_files(root / "maps" / video_id):
+                stem = ground_map_path.stem
+                expected.append(
+                    (
+                        video_id,
+                        stem,
+                        ground_map_path,
+                        root / "fixation" / video_id / f"{stem}.png",
+                    )
+                )
+        return expected
+
+    if dataset_name != "Sports-360":
+        raise ValueError(f"Unsupported dataset for ERP evaluation: {dataset_name}")
+    if not root.is_dir():
+        raise FileNotFoundError(f"Ground-truth directory not found: {root}")
+
+    for video_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+        for ground_map_path in _image_files(video_dir / "maps"):
+            stem = ground_map_path.stem
+            expected.append(
+                (
+                    video_dir.name,
+                    stem,
+                    ground_map_path,
+                    video_dir / "fixation" / f"{stem}.png",
+                )
+            )
+    return expected
+
+
+def evaluate_saliency_maps_in_folder(
+        saliency_folder,
+        ground_truth_root,
+        DatasetName,
+        dataset_split=1,
+        expected_frames=None,
+):
+    """Evaluate ERP predictions and report test-set coverage statistics."""
+    if expected_frames is None:
+        expected_frames = _expected_erp_frames(
+            ground_truth_root,
+            DatasetName,
+            dataset_split,
+        )
+    metric_values = {
+        "AUC-J": [],
+        "NSS": [],
+        "KL Divergence": [],
+        "SIM": [],
+        "CC": [],
+    }
+    matched_frames = 0
+    missing_predictions = 0
+    skipped_abnormal = 0
+    evaluated_frames = 0
+
+    for video_id, stem, ground_map_path, ground_fix_path in expected_frames:
+        prediction_path = Path(saliency_folder) / video_id / f"{stem}.png"
+        if not prediction_path.is_file():
+            missing_predictions += 1
+            continue
+
+        if not ground_fix_path.is_file():
+            skipped_abnormal += 1
+            print(f"Missing fixation map, skipping: {ground_fix_path}")
+            continue
+
+        matched_frames += 1
+        try:
+            sal_map = load_saliency_map_from_png(str(prediction_path))
+            ground_map = load_ground_map_from_png(str(ground_map_path))
+            ground_fix = load_ground_fix_from_png(str(ground_fix_path))
+            if not np.any(sal_map):
+                raise ValueError("prediction is all zero")
+
+            frame_metrics = {
+                "AUC-J": AUC_Judd(sal_map, ground_fix),
+                "NSS": NSS(sal_map, ground_fix),
+                "KL Divergence": KLD(sal_map, ground_map),
+                "SIM": SIM(sal_map, ground_map),
+                "CC": CC(sal_map, ground_map),
+            }
+            if not all(np.isfinite(value) for value in frame_metrics.values()):
+                raise ValueError(f"non-finite metrics: {frame_metrics}")
+        except Exception as error:
+            skipped_abnormal += 1
+            print(f"Abnormal sample skipped ({prediction_path}): {error}")
+            continue
+
+        for name, value in frame_metrics.items():
+            metric_values[name].append(value)
+        evaluated_frames += 1
+
+    print("\n========== ERP Evaluation Coverage ==========")
+    print(f"应有帧数: {len(expected_frames)}")
+    print(f"实际匹配帧数: {matched_frames}")
+    print(f"缺失预测帧数: {missing_predictions}")
+    print(f"跳过异常样本数: {skipped_abnormal}")
+    print(f"成功计算指标帧数: {evaluated_frames}")
+
+    results = {}
+    if evaluated_frames:
+        for name, values in metric_values.items():
+            results[name] = float(np.mean(values))
+            print(f"Average {name}: {results[name]}")
     else:
         print("No valid results found.")
 
+    results["counts"] = {
+        "expected_frames": len(expected_frames),
+        "matched_frames": matched_frames,
+        "missing_predictions": missing_predictions,
+        "skipped_abnormal": skipped_abnormal,
+        "evaluated_frames": evaluated_frames,
+    }
+    return results
 
-if __name__ == '__main__':
 
-                              
-    DatasetName = "AVS-ODV"
-                                   
-
+if __name__ == "__main__":
+    dataset_name = "AVS-ODV"
     model = "SphereUformer-split-2"
-                             
-    saliency_folder = '/home/dyz/PythonProject/DataSet_Output/'+DatasetName+'/Results/Results_Oth/Saliency/'+model +'/saliency_png'
-                                                                                                             
-    ground_truth_folder = '/home/dyz/PythonProject/Dataset/' + DatasetName 
-                                                          
-                            
-    evaluate_saliency_maps_in_folder(saliency_folder, ground_truth_folder,DatasetName)
-
-                                                                                          
+    saliency_root = (
+        "/home/dyz/PythonProject/DataSet_Output/"
+        + dataset_name
+        + "/Results/Results_Oth/Saliency/"
+        + model
+        + "/saliency_png"
+    )
+    ground_truth_folder = "/home/dyz/PythonProject/Dataset/" + dataset_name
+    evaluate_saliency_maps_in_folder(
+        saliency_root,
+        ground_truth_folder,
+        dataset_name,
+    )

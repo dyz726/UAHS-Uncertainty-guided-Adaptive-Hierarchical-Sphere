@@ -96,14 +96,14 @@ def loss_helper(model, args):
     trainer = Trainer.__new__(Trainer)
     trainer.model = model
     trainer.args = args
-    trainer.loss_kl_cc = Trainer.loss_kl_cc.__get__(trainer, Trainer)
+    trainer.loss_kl = Trainer.loss_kl.__get__(trainer, Trainer)
     trainer.area_weighted_mean = Trainer.area_weighted_mean
     return trainer
 
 
 def complete_loss(trainer, target, outputs):
     batch_size, time_steps, vertices = target.shape
-    loss_final = trainer.loss_kl_cc(
+    loss_final = trainer.loss_kl(
         outputs["saliency"].reshape(batch_size * time_steps, vertices),
         target.reshape(batch_size * time_steps, vertices),
         gt_fix=None,
@@ -230,6 +230,9 @@ def routing_report(model, outputs):
             (outputs["selected_area_l2"] - model.target_refine_ratio_l2).abs()
             <= tolerance_l2
         ).all()),
+        "hierarchical_budget": bool((
+            outputs["selected_area_l2"] <= outputs["selected_area_l1"]
+        ).all()),
         "l5_selected_queries_only": (
             0 < queries_l5 < dense_l5
             and model.sparse_refiner_l5.attention.last_query_count == queries_l5
@@ -350,6 +353,8 @@ def run_preflight(sequence_length=12, iterations=3):
                 ),
                 "uncertainty_l4": tensor_statistics(outputs["uncertainty_l4"]),
                 "uncertainty_l5": tensor_statistics(outputs["uncertainty_l5"]),
+                "fixed_budget_l5": model.target_refine_ratio_l1,
+                "fixed_budget_l6": model.target_refine_ratio_l2,
                 "temporal_mask_iou_l4": temporal_mask_iou(
                     outputs["hard_face_mask_l4"]
                 ),
@@ -470,7 +475,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sequence_length", type=int, default=12)
     parser.add_argument("--iterations", type=int, default=3)
-    parser.add_argument("--output", default="log/uahs_uncertainty_only_preflight.json")
+    parser.add_argument("--output", default="log/uahs_fixed_temporal_preflight.json")
     arguments = parser.parse_args()
     report = run_preflight(arguments.sequence_length, arguments.iterations)
     output_parent = os.path.dirname(os.path.abspath(arguments.output))

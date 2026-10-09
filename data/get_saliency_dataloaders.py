@@ -8,11 +8,13 @@ from torch.utils.data import DataLoader
 from .DataLoader360Video import AVSSaliencyDataset, SaliencyDataset
 
 
-NO_AUGMENTATION = {
-    "color_augmentation": False,
-    "lr_flip_augmentation": False,
-    "yaw_rotation_augmentation": False,
-}
+def resolve_dataset_split(dataset_name, dataset_split):
+    """Return the split supported by the selected dataset."""
+    if dataset_name == "VR-EyeTracking" and dataset_split != 1:
+        raise ValueError("VR-EyeTracking provides only dataset_split=1")
+    if dataset_name in {"SVGC_AVA", "Sports-360"} and dataset_split == 3:
+        return 1
+    return dataset_split
 
 
 def _video_ids(dataset_root_dir, data_type):
@@ -45,12 +47,16 @@ def _video_ids(dataset_root_dir, data_type):
     )
 
 
-def _avs_video_ids(dataset_root_dir, data_type, dataset_split):
-    """读取 AVS-ODV 的划分文件（train_list_N.txt / test_list_N.txt），返回视频ID列表。"""
-    list_file = os.path.join(dataset_root_dir, f"{data_type}_list_{dataset_split}.txt")
+def _split_video_ids(dataset_root_dir, data_type, dataset_split, dataset_name):
+    """Read the dataset's explicit video-level train/test split."""
+    split_file = (
+        f"{data_type}_list.txt" if dataset_name == "VR-EyeTracking"
+        else f"{data_type}_list_{dataset_split}.txt"
+    )
+    list_file = os.path.join(dataset_root_dir, split_file)
     if not os.path.isfile(list_file):
-        raise FileNotFoundError(f"AVS-ODV split file not found: {list_file}")
-    with open(list_file, "r") as f:
+        raise FileNotFoundError(f"{dataset_name} split file not found: {list_file}")
+    with open(list_file, "r", encoding="utf-8") as f:
         return [line.strip().split()[0] for line in f if line.strip()]
 
 
@@ -59,7 +65,6 @@ def get_dataloaders(
     dataset_name: str,
     dataset_root_dir: Optional[str],
     dataset_kwargs: Dict[str, Any],
-    augmentation_kwargs: Dict[str, Any],
     train_batch_size: int,
     val_batch_size: int,
     num_workers: int,
@@ -69,10 +74,14 @@ def get_dataloaders(
     if dataset_root_dir is None:
         raise ValueError("dataset_root_dir is required")
 
+    dataset_split = resolve_dataset_split(dataset_name, dataset_split)
+
     if dataset_name == "AVS-ODV":
                                                                        
         if is_test:
-            test_videos = _avs_video_ids(dataset_root_dir, "test", dataset_split)
+            test_videos = _split_video_ids(
+                dataset_root_dir, "test", dataset_split, dataset_name
+            )
             if not test_videos:
                 raise RuntimeError(f"No {dataset_name} test videos were found")
             print(f"{dataset_name} (split {dataset_split}) test videos: {len(test_videos)}")
@@ -81,10 +90,11 @@ def get_dataloaders(
                 root_dir=dataset_root_dir,
                 video_id=test_videos,
                 dataset_kwargs=dataset_kwargs,
-                augmentation_kwargs=NO_AUGMENTATION,
             )
         else:
-            video_names = _avs_video_ids(dataset_root_dir, "train", dataset_split)
+            video_names = _split_video_ids(
+                dataset_root_dir, "train", dataset_split, dataset_name
+            )
             if len(video_names) < 2:
                 raise RuntimeError(f"At least two {dataset_name} training videos are required")
 
@@ -102,51 +112,64 @@ def get_dataloaders(
                 root_dir=dataset_root_dir,
                 video_id=train_videos,
                 dataset_kwargs=dataset_kwargs,
-                augmentation_kwargs=augmentation_kwargs,
             )
             dataset_val = AVSSaliencyDataset(
                 dataname=dataset_name,
                 root_dir=dataset_root_dir,
                 video_id=val_videos,
                 dataset_kwargs=dataset_kwargs,
-                augmentation_kwargs=NO_AUGMENTATION,
             )
-    elif dataset_name in {"Sports-360", "SVGC_AVA"}:
-                                                              
+    elif dataset_name in {"SVGC_AVA", "Sports-360", "VR-EyeTracking"}:
+        train_videos = _split_video_ids(
+            dataset_root_dir, "train", dataset_split, dataset_name
+        )
+        test_videos = _split_video_ids(
+            dataset_root_dir, "test", dataset_split, dataset_name
+        )
+        overlap = sorted(set(train_videos) & set(test_videos))
+        if overlap:
+            raise RuntimeError(
+                f"{dataset_name} split {dataset_split} contains videos in both "
+                f"train and test lists: {overlap}"
+            )
+        if not train_videos or not test_videos:
+            raise RuntimeError(
+                f"{dataset_name} split {dataset_split} requires non-empty train and test lists"
+            )
+
         if is_test:
-            test_videos = _video_ids(dataset_root_dir, "test")
-            if not test_videos:
-                raise RuntimeError(f"No {dataset_name} test videos were found")
-            print(f"{dataset_name} test videos: {len(test_videos)}")
+            print(
+                f"{dataset_name} (split {dataset_split}) test videos: "
+                f"{len(test_videos)}"
+            )
             dataset_train = dataset_val = SaliencyDataset(
                 dataname=dataset_name,
                 root_dir=dataset_root_dir,
                 video_id=test_videos,
                 dataset_kwargs=dataset_kwargs,
-                augmentation_kwargs=NO_AUGMENTATION,
                 data_type="test",
-                include_partial=False,
+                include_partial=dataset_name == "VR-EyeTracking",
             )
         else:
-            video_names = _video_ids(dataset_root_dir, "train")
-            if len(video_names) < 2:
-                raise RuntimeError(f"At least two {dataset_name} training videos are required")
-
             rng = random.Random(33)
-            rng.shuffle(video_names)
-            split_idx = int(0.8 * len(video_names))
-            train_videos = video_names[:split_idx]
-            val_videos = video_names[split_idx:]
+            rng.shuffle(train_videos)
+            split_idx = int(0.8 * len(train_videos))
+            val_videos = train_videos[split_idx:]
+            train_videos = train_videos[:split_idx]
+            if not train_videos or not val_videos:
+                raise RuntimeError(
+                    f"At least two {dataset_name} training videos are required"
+                )
             print(
-                f"{dataset_name} video split: {len(train_videos)} train, "
-                f"{len(val_videos)} validation"
+                f"{dataset_name} (split {dataset_split}) video split: "
+                f"{len(train_videos)} train, {len(val_videos)} validation; "
+                f"{len(test_videos)} test videos remain held out"
             )
             dataset_train = SaliencyDataset(
                 dataname=dataset_name,
                 root_dir=dataset_root_dir,
                 video_id=train_videos,
                 dataset_kwargs=dataset_kwargs,
-                augmentation_kwargs=augmentation_kwargs,
                 data_type="train",
             )
             dataset_val = SaliencyDataset(
@@ -154,13 +177,12 @@ def get_dataloaders(
                 root_dir=dataset_root_dir,
                 video_id=val_videos,
                 dataset_kwargs=dataset_kwargs,
-                augmentation_kwargs=NO_AUGMENTATION,
                 data_type="train",
             )
     else:
         raise ValueError(
             f"Unsupported dataset_name: {dataset_name} "
-            f"(expected one of: Sports-360, AVS-ODV, SVGC_AVA)"
+            f"(expected one of: Sports-360, AVS-ODV, SVGC_AVA, VR-EyeTracking)"
         )
 
     loader_train = DataLoader(
